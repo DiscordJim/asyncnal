@@ -1,0 +1,10 @@
+[package]
+name = "asyncnal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = "1.45.1"
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["full"] }
