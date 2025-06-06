@@ -14,6 +14,8 @@ use std::{
 
 use tokio::task::id;
 
+mod linked_list;
+
 const SIGNAL_FLAG_EMPTY: usize = 0x00;
 const SIGNAL_FLAG_WAIT: usize = 0x01;
 const SIGNAL_FLAG_SET: usize = 0x02;
@@ -172,9 +174,26 @@ impl AutoEvent {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListAtomicLink};
     use tokio::{sync::Barrier, time::sleep};
 
     use crate::AutoEvent;
+
+    struct Test {
+        link: LinkedListAtomicLink,
+        value: usize
+    }
+
+    intrusive_adapter!(MyAdapter = Box<Test>: Test { link: LinkedListAtomicLink });
+
+    #[test]
+    pub fn test_linky() {
+
+        // let tra = LinkedList::new(MyAdapter::new());
+        // tra.pop_back()
+
+        panic!("yee");
+    }
 
     #[tokio::test]
     pub async fn waiter() {
