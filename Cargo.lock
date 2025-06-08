@@ -29,6 +29,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "intrusive-collections",
+ "rsevents",
  "tokio",
 ]
 
@@ -200,6 +201,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "928fca9cf2aa042393a8325b9ead81d2f0df4cb12e1e24cef072922ccd99c5af"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rsevents"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8e29769fda0194d58e06d876d82337aac382415df547f073f44ffea0bb0c651"
+dependencies = [
+ "parking_lot_core",
 ]
 
 [[package]]

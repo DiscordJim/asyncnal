@@ -14,6 +14,10 @@ use std::{
 
 use tokio::task::id;
 
+use crate::async_lot::AsyncLot;
+
+mod async_lot;
+mod atom_lock;
 mod linked_list;
 
 const SIGNAL_FLAG_EMPTY: usize = 0x00;
@@ -26,7 +30,7 @@ pub struct AutoEvent {
 
 struct RawEvent {
     inner: AtomicUsize,
-    waker: Mutex<LinkedList<Waker>>,
+    waker: AsyncLot,
 }
 
 unsafe impl Send for RawEvent {}
@@ -34,12 +38,13 @@ unsafe impl Sync for RawEvent {}
 
 pub struct RawEventAwait<'a> {
     event: &'a RawEvent,
-    is_live: bool, // waker: UnsafeCell<Option<Waker>>,
-    is_parked: bool,
+    is_live: bool,
 }
 
 impl<'a> RawEventAwait<'a> {
-    fn swap_in(&self, current: u8, new: u8) {}
+    fn swap_in(&self, current: usize, new: usize) -> bool {
+        self.event.inner.compare_exchange_weak(current, new, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
 }
 
 impl Future for RawEventAwait<'_> {
@@ -49,89 +54,65 @@ impl Future for RawEventAwait<'_> {
 
         let current_count = current >> 2;
 
-
-        if current_count != 0 && !self.is_live && current & SIGNAL_FLAG_WAIT == 0 {
-            // We are not live and the count is not zero.
-        
-            // Clear the last two bits, this allows us to acquire the lock and immediately signal.
-            let alledged = (((current >> 2) - 1) << 2);
-
-            if self.event.inner.compare_exchange_weak(current, alledged, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                if self.is_parked {
-                    // Remove us from the queue
-                    self.event.waker.lock().unwrap().pop_front();
-                }
-                if let Some(next) = self.event.waker.lock().unwrap().front() {
-                    next.wake_by_ref();
-                }
-                // self.event.waker.lock().unwrap().front().unwrap()
+        if self.is_live {
+            // We are the live entity, i.e., the entity at the front of the queue about to be
+            // activated.
+            if self.swap_in(current | SIGNAL_FLAG_SET, subtract_current(current) & !0x3) {
+                // Wake up the next.
+                self.event.waker.unpark_one();
                 return Poll::Ready(());
+            } else {
+                // We failed, in this case we need to retry.
+                self.event.waker.park_front(cx.waker());
+                return Poll::Pending;
             }
-        }
+        } else if current_count != 0 && !self.is_live && current & SIGNAL_FLAG_WAIT == 0 {
+            // We are not live and the count is not zero.
 
-        if
-        // Check if the wait bit is set.
-        current & SIGNAL_FLAG_WAIT == 0
-            // Try to acquire the atomic.
-            && self.event.inner.compare_exchange_weak(current, current | SIGNAL_FLAG_WAIT, Ordering::Acquire, Ordering::Relaxed).is_ok()
-        {
-            
+            // Clear the last two bits, this allows us to acquire the lock and immediately signal.
+            let alledged = ((current >> 2) - 1) << 2;
 
-             // We were empty and now we are filled.
-                self.is_live = true;
-                self.event
-                    .waker
-                    .lock()
-                    .unwrap()
-                    .push_front(cx.waker().clone());
-
-            
-            println!("Entering wait... #{} [{}]", id(), current_count);
-            // println!("modded: {:064b}", self.event.inner.load(Ordering::Acquire));
-            return Poll::Pending;
-        }
-
-        // if self.is_live {
-        //     println!("Hello:\t\t{:064b}", current);
-        //     println!("Proposed:\t{:064b}", current | SIGNAL_FLAG_SET);
-        // }
-
-        if self.is_live
-            && (self
+            if self
                 .event
                 .inner
-                .compare_exchange_weak(
-                    current | SIGNAL_FLAG_SET,
-                    current & !0x03,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok())
-        {
-            let handle = self.event.waker.lock().unwrap();
-            if !handle.is_empty() {
-                println!("List is not empty.");
-                handle.front().unwrap().wake_by_ref();
+                .compare_exchange_weak(current, alledged, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                println!("Fast path (A)");
+                self.event.waker.unpark_one();
+                return Poll::Ready(());
+            } else {
+                println!("Deferred path (A)");
             }
-            println!("Exiting signal: #{}", id());
-            return Poll::Ready(());
+        } else if
+            // No waiters quite yet.
+            current_count == 0
+            // There is no active waiter.
+            && current & SIGNAL_FLAG_WAIT == 0
+            // And we aquire the live status.
+            && self.swap_in(current, current | SIGNAL_FLAG_WAIT)
+            {
+                println!("Path (B)");
+                self.is_live = true;
+                self.event.waker.park_front(cx.waker());
+                return Poll::Pending;
+
         }
 
-        // if (!self.event.inner.compare_exchange_weak(current, current | 0x01, Ordering::Acquire, Ordering::Relaxed) & 0x01) != 0 {
-        //     println!("EMPTY");
-        // }
+  
 
         // This is the failing path.
         println!("Going to failure: {:?}", tokio::task::id());
         println!("Current: {:064b}", current);
-        self.event
-            .waker
-            .lock()
-            .unwrap()
-            .push_back(cx.waker().clone());
-        self.is_parked = true;
+        self.event.waker.park(cx.waker());
         Poll::Pending
     }
+}
+
+#[inline(always)]
+fn subtract_current(current: usize) -> usize {
+    let original = current & 0x3;
+    (((current >> 2) - 1) << 2) | original
 }
 
 impl AutoEvent {
@@ -139,15 +120,14 @@ impl AutoEvent {
         Self {
             inner: RawEvent {
                 inner: AtomicUsize::new(0),
-                waker: Mutex::default(),
+                waker: AsyncLot::default(),
             },
         }
     }
     pub fn wait(&self) -> RawEventAwait<'_> {
         RawEventAwait {
             event: &self.inner,
-            is_live: false,
-            is_parked: false
+            is_live: false
         }
     }
     pub fn wake(&self) {
@@ -163,40 +143,85 @@ impl AutoEvent {
         if count & SIGNAL_FLAG_WAIT != 0 && count & SIGNAL_FLAG_SET == 0 {
             println!("We were signaled, we are going to wake.");
             // Someone is waiting, so we wake them up.
-            if let Some(inner) = self.inner.waker.lock().unwrap().pop_front() {
-                inner.wake_by_ref();
-            }
+            self.inner.waker.unpark_one();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{sync::Arc, thread::{self, current, sleep}, time::Duration};
 
-    use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListAtomicLink};
-    use tokio::{sync::Barrier, time::sleep};
+    use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
+    use rsevents::{AutoResetEvent, Awaitable};
+    use tokio::{sync::Barrier};
 
     use crate::AutoEvent;
 
     struct Test {
         link: LinkedListAtomicLink,
-        value: usize
+        value: usize,
     }
 
     intrusive_adapter!(MyAdapter = Box<Test>: Test { link: LinkedListAtomicLink });
 
     #[test]
     pub fn test_linky() {
-
         // let tra = LinkedList::new(MyAdapter::new());
         // tra.pop_back()
 
         panic!("yee");
     }
 
+    #[test]
+    pub fn waiter_rsevents() {
+        use std::sync::Barrier;
+        use std::thread::sleep;
+    
+        let signal = Arc::new(AutoResetEvent::new(rsevents::EventState::Unset));
+        let barrier = Arc::new(Barrier::new(11));
+
+        let waiters = 10;
+        let mut bucket = vec![];
+
+        for i in 0..waiters {
+            bucket.push(thread::spawn({
+                let signal = signal.clone();
+                let barrier = barrier.clone();
+                move || {
+                    barrier.wait();
+                    signal.wait();
+
+                    println!("Wake: {:?}", current().id());
+
+                }
+            }));
+            // sleep(Duration::from_secs(1)).await;
+        }
+
+        // sleep(Duration::from_secs(1)).await;
+        // barrier.wait();
+
+        // sleep(Duration::from_millis(10));
+
+        for i in 0..5 {
+            // sleep(Duration::from_millis(10)).await;
+            signal.set();
+            println!("Signal woken #{}", i);
+            // signal.wake();
+        }
+        barrier.wait();
+
+        for v in bucket {
+            v.join().unwrap();
+        }
+
+        // signal.wait().await;
+    }
+
+
     #[tokio::test]
-    pub async fn waiter() {
+    pub async fn waiter_async() {
         let signal = Arc::new(AutoEvent::new());
         let barrier = Arc::new(Barrier::new(11));
 
@@ -219,14 +244,16 @@ mod tests {
         }
 
         // sleep(Duration::from_secs(1)).await;
-        barrier.wait().await;
+        
 
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10));
 
-        for i in 0..10 {
+        for i in 0..5 {
             // sleep(Duration::from_millis(10)).await;
             signal.wake();
         }
+
+        barrier.wait().await;
 
         for v in bucket {
             v.await.unwrap();
