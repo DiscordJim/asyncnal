@@ -62,16 +62,3 @@ impl<'a, T> Drop for AtomicLocked<'a, T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::atom_lock::AtomicLock;
-
-
-
-    #[tokio::test]
-    pub async fn spin_lock() {
-        let lock = AtomicLock::new(());
-
-        
-    }
-}

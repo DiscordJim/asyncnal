@@ -1,35 +1,30 @@
 use std::{
-    cell::UnsafeCell,
-    collections::LinkedList,
     pin::Pin,
-    ptr,
-    sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll, Wake, Waker},
-    thread::sleep,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU8, Ordering},
+    task::{Context, Poll, Waker},
 };
 
-use tokio::task::id;
+
+mod atomic;
 
 use crate::async_lot::AsyncLot;
 
 mod async_lot;
 mod atom_lock;
-mod linked_list;
+mod yielder;
 
-const SIGNAL_FLAG_EMPTY: usize = 0x00;
-const SIGNAL_FLAG_WAIT: usize = 0x01;
-const SIGNAL_FLAG_SET: usize = 0x02;
+const SIGNAL_FREE: u8 = 0x00;
+const SIGNAL_WAIT: u8 = 0x01;
+const SIGNAL_SET: u8 = 0x02;
+
+use crate::atomic::*;
 
 pub struct AutoEvent {
     inner: RawEvent,
 }
 
 struct RawEvent {
-    inner: AtomicUsize,
+    inner: AtomicU8,
     waker: AsyncLot,
 }
 
@@ -38,88 +33,172 @@ unsafe impl Sync for RawEvent {}
 
 pub struct RawEventAwait<'a> {
     event: &'a RawEvent,
-    is_live: bool,
+    is_parked: bool,
 }
 
 impl<'a> RawEventAwait<'a> {
-    fn swap_in(&self, current: usize, new: usize) -> bool {
-        self.event.inner.compare_exchange_weak(current, new, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    #[inline]
+    fn swap_in(&self, current: u8, new: u8) -> bool {
+        self.event
+            .inner
+            .compare_exchange_weak(current, new, Acquire, Relaxed)
+            .is_ok()
+    }
+    #[inline]
+    fn park_waker(&mut self, waker: &Waker) {
+        self.is_parked = true;
+        self.event.waker.park(waker);
     }
 }
 
 impl Future for RawEventAwait<'_> {
     type Output = ();
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let current = self.event.inner.load(Ordering::Relaxed);
-
-        let current_count = current >> 2;
-
-        if self.is_live {
-            // We are the live entity, i.e., the entity at the front of the queue about to be
-            // activated.
-            if self.swap_in(current | SIGNAL_FLAG_SET, subtract_current(current) & !0x3) {
-                // Wake up the next.
+        // First we want to check if the signal is set, if so we can just bypass all this checking.
+        match self
+            .event
+            .inner
+            .compare_exchange_weak(SIGNAL_SET, SIGNAL_FREE, Acquire, Relaxed)
+        {
+            Ok(_) => {
+                // We've gone through the fast path.
+                if self.is_parked {
+                    // Direct acquisition, we must be at the top of the queue.
+                    self.event.waker.unpark_one();
+                }
+                // Wake up the next person in line (if there is one)
                 self.event.waker.unpark_one();
-                return Poll::Ready(());
-            } else {
-                // We failed, in this case we need to retry.
-                self.event.waker.park_front(cx.waker());
-                return Poll::Pending;
+                return Poll::Ready(()); // We can return.
             }
-        } else if current_count != 0 && !self.is_live && current & SIGNAL_FLAG_WAIT == 0 {
-            // We are not live and the count is not zero.
+            Err(x) => {
+                // If we enter this branch then the signal was not set.
+                println!("Tried to swap, read pattern: {:08b}", x);
+                match x {
+                    0b00 => {
+                        // bit pattern of SIGNAL_FREE
+                        if self.swap_in(SIGNAL_FREE, SIGNAL_WAIT) {
+                            // try to set the bit pattern to waiting.
+                            self.park_waker(cx.waker());
+                            return Poll::Pending; // return pending as we are waiting
+                        } else {
+                            // In this case we just retry.
+                            return self.poll(cx);
+                        }
 
-            // Clear the last two bits, this allows us to acquire the lock and immediately signal.
-            let alledged = ((current >> 2) - 1) << 2;
+                    },
+                    0b01 => {
+                        // bit pattern: SIGNAL WAIT
+                        self.park_waker(cx.waker());
+                        return Poll::Pending;
+                    }
+                    0b10 => {
+                        // failed spontaneously, try again.
+                        return self.poll(cx);
+                    }
+                    0b11 => {
+                        // Result: The signal is both set & waiting.
+                        if self.is_parked {
+                            // If we are already parked then we must be the top of the queue.
 
-            if self
-                .event
-                .inner
-                .compare_exchange_weak(current, alledged, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                println!("Fast path (A)");
-                self.event.waker.unpark_one();
-                return Poll::Ready(());
-            } else {
-                println!("Deferred path (A)");
+                            // ready the next wakeup.
+                            self.event.waker.unpark_one();
+
+                            return Poll::Ready(());
+                        } else {
+                            self.park_waker(cx.waker());
+                            return Poll::Pending;
+                        }
+                    }
+                    _ => unreachable!()
+                }
+                
             }
-        } else if
-            // No waiters quite yet.
-            current_count == 0
-            // There is no active waiter.
-            && current & SIGNAL_FLAG_WAIT == 0
-            // And we aquire the live status.
-            && self.swap_in(current, current | SIGNAL_FLAG_WAIT)
-            {
-                println!("Path (B)");
-                self.is_live = true;
-                self.event.waker.park_front(cx.waker());
-                return Poll::Pending;
-
         }
-
-  
-
-        // This is the failing path.
-        println!("Going to failure: {:?}", tokio::task::id());
-        println!("Current: {:064b}", current);
-        self.event.waker.park(cx.waker());
-        Poll::Pending
     }
 }
 
-#[inline(always)]
-fn subtract_current(current: usize) -> usize {
-    let original = current & 0x3;
-    (((current >> 2) - 1) << 2) | original
-}
+// impl Future for RawEventAwait<'_> {
+//     type Output = ();
+//     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         // println!("Getting polled...");
+//         // This is a similar optimization that is applied in the AutoResetEvents from the `rsevents` crate, basically if the flag is
+//         // set and the signal is not contended then we immediately can poll [Poll::Ready].
+//         match self.event.inner.compare_exchange_weak(SIGNAL_SET, SIGNAL_FREE, Ordering::Acquire, Ordering::Relaxed) {
+//             Ok(_) => {
+//                 // println!("Fast path...");
+//                 if self.is_parked {
+//                     // println!("Fast path live. Double popping the queue.");
+//                     self.event.waker.unpark_one();
+//                 }
+//                 self.event.waker.unpark_one();
+//                 return Poll::Ready(())
+//             }
+//             Err(current) => {
+//                 // The bit pattern is restricted to the first tow.
+//                 debug_assert_eq!(current & !0x3, 0);
+
+//                 match current {
+//                     SIGNAL_FREE => {
+//                         if self.swap_in(SIGNAL_FREE, SIGNAL_WAIT) {
+//                             self.is_parked = true;
+//                             self.event.waker.park_front(cx.waker());
+//                             return Poll::Pending;
+//                         }
+
+//                     }
+//                     SIGNAL_WAIT => {
+//                         /* We let the control flow fall through here, we will be scheduled for wakeup automatically at the end of the match. */
+//                     }
+//                     0b11 => {
+//                         if self.is_parked {
+//                             // If we are already parked then the following conditions must be true:
+//                             // 1. We have already scheduled ourselves.
+//                             // 2. We were called in order.
+
+//                             // This kicks us off the stack.
+//                             self.event.waker.unpark_off_stack();
+
+//                             if self.event.waker.len() == 0 {
+//                                 // println!("FULLY FREEING THE SIGNAL!!");
+//                                 // Since there is nothing let in the queue, the signal is fully free.
+//                                 self.event.inner.store(SIGNAL_FREE, Ordering::Release);
+//                             } else {
+//                                 // Since the pattern is SIGNAL_SET | SIGNAL_WAIT, we want to unset
+//                                 // the SET bit, but we do not want new people jumping to the top of the
+//                                 // queue so we leave the wait bit set.
+//                                 self.event.inner.store(SIGNAL_WAIT, Ordering::Release);
+//                             }
+
+//                             self.event.waker.unpark_one();
+//                             return Poll::Ready(());
+//                         }
+//                     }
+//                     SIGNAL_SET => {
+//                         // if
+//                         println!("SIGNAL SET??");
+//                     }
+//                     x => panic!("Invalid bit pattern: {x:08b}")
+//                 }
+
+//                 if !self.is_parked {
+//                     self.is_parked = true;
+//                     self.event.waker.park(cx.waker());
+//                 }
+
+//                 // This is the failure path, basically if the current op did not work
+//                 // we fall back into the pending state.
+//                 Poll::Pending
+//             }
+//         }
+//     }
+// }
 
 impl AutoEvent {
     pub fn new() -> Self {
         Self {
             inner: RawEvent {
-                inner: AtomicUsize::new(0),
+                inner: AtomicU8::default(),
                 waker: AsyncLot::default(),
             },
         }
@@ -127,98 +206,91 @@ impl AutoEvent {
     pub fn wait(&self) -> RawEventAwait<'_> {
         RawEventAwait {
             event: &self.inner,
-            is_live: false
+            is_parked: false,
         }
     }
     pub fn wake(&self) {
         let state = self.inner.inner.load(Ordering::Acquire);
-        // let bits = state & 0x3;
-        let count = (((state >> 2) + 1) << 2) | (state & 0x03);
-        let new = count | SIGNAL_FLAG_SET;
-        println!("New: {:064b}", count);
-        self.inner
-            .inner
-            .store(count | SIGNAL_FLAG_SET, Ordering::SeqCst);
-
-        if count & SIGNAL_FLAG_WAIT != 0 && count & SIGNAL_FLAG_SET == 0 {
-            println!("We were signaled, we are going to wake.");
-            // Someone is waiting, so we wake them up.
-            self.inner.waker.unpark_one();
-        }
+        self.inner.inner.store(state | SIGNAL_SET, Ordering::SeqCst);
+        self.inner.waker.unpark_one();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread::{self, current, sleep}, time::Duration};
+    use std::{
+        sync::Arc,
+        thread::{self, current, sleep},
+        time::Duration,
+    };
 
-    use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
+    // use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
     use rsevents::{AutoResetEvent, Awaitable};
-    use tokio::{sync::Barrier};
+    use tokio::sync::Barrier;
 
     use crate::AutoEvent;
 
-    struct Test {
-        link: LinkedListAtomicLink,
-        value: usize,
-    }
+    // struct Test {
+    //     link: LinkedListAtomicLink,
+    //     value: usize,
+    // }
 
-    intrusive_adapter!(MyAdapter = Box<Test>: Test { link: LinkedListAtomicLink });
+    // intrusive_adapter!(MyAdapter = Box<Test>: Test { link: LinkedListAtomicLink });
 
-    #[test]
-    pub fn test_linky() {
-        // let tra = LinkedList::new(MyAdapter::new());
-        // tra.pop_back()
+    // #[test]
+    // pub fn test_linky() {
+    //     // let tra = LinkedList::new(MyAdapter::new());
+    //     // tra.pop_back()
 
-        panic!("yee");
-    }
+    //     panic!("yee");
+    // }
 
-    #[test]
-    pub fn waiter_rsevents() {
-        use std::sync::Barrier;
-        use std::thread::sleep;
-    
-        let signal = Arc::new(AutoResetEvent::new(rsevents::EventState::Unset));
-        let barrier = Arc::new(Barrier::new(11));
+    // #[test]
+    // pub fn waiter_rsevents() {
+    //     use std::sync::Barrier;
+    //     use std::thread::sleep;
 
-        let waiters = 10;
-        let mut bucket = vec![];
+    //     let signal = Arc::new(AutoResetEvent::new(rsevents::EventState::Unset));
+    //     let barrier = Arc::new(Barrier::new(11));
 
-        for i in 0..waiters {
-            bucket.push(thread::spawn({
-                let signal = signal.clone();
-                let barrier = barrier.clone();
-                move || {
-                    barrier.wait();
-                    signal.wait();
+    //     let waiters = 10;
+    //     let mut bucket = vec![];
 
-                    println!("Wake: {:?}", current().id());
+    //     for i in 0..waiters {
+    //         bucket.push(thread::spawn({
+    //             let signal = signal.clone();
+    //             let barrier = barrier.clone();
+    //             move || {
+    //                 println!("Waiting...");
+    //                 barrier.wait();
+    //                 signal.wait();
 
-                }
-            }));
-            // sleep(Duration::from_secs(1)).await;
-        }
+    //                 println!("Wake: {:?}", current().id());
+    //             }
+    //         }));
+    //         // sleep(Duration::from_secs(1)).await;
+    //     }
 
-        // sleep(Duration::from_secs(1)).await;
-        // barrier.wait();
+    //     // sleep(Duration::from_secs(1)).await;
+    //     // barrier.wait();
 
-        // sleep(Duration::from_millis(10));
+    //     // sleep(Duration::from_millis(10));
 
-        for i in 0..5 {
-            // sleep(Duration::from_millis(10)).await;
-            signal.set();
-            println!("Signal woken #{}", i);
-            // signal.wake();
-        }
-        barrier.wait();
+    //      barrier.wait();
 
-        for v in bucket {
-            v.join().unwrap();
-        }
+    //     for i in 0..waiters {
+    //         // sleep(Duration::from_millis(10)).await;
+    //         signal.set();
+    //         println!("Signal woken #{}", i);
+    //         // signal.wake();
+    //     }
 
-        // signal.wait().await;
-    }
+    //     for v in bucket {
+    //         v.join().unwrap();
+    //     }
 
+    //     // signal.wait().await;
+    // }
 
     #[tokio::test]
     pub async fn waiter_async() {
@@ -233,6 +305,7 @@ mod tests {
                 let signal = signal.clone();
                 let barrier = barrier.clone();
                 async move {
+                    println!("Task {i} waiting...");
                     barrier.wait().await;
 
                     signal.wait().await;
@@ -244,16 +317,15 @@ mod tests {
         }
 
         // sleep(Duration::from_secs(1)).await;
-        
-
-        sleep(Duration::from_millis(10));
-
-        for i in 0..5 {
-            // sleep(Duration::from_millis(10)).await;
-            signal.wake();
-        }
 
         barrier.wait().await;
+        sleep(Duration::from_millis(10));
+        println!("Barrier fully done...");
+
+        for i in 0..10 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            signal.wake();
+        }
 
         for v in bucket {
             v.await.unwrap();
@@ -263,6 +335,6 @@ mod tests {
     }
 }
 
-// pub struct AutoEventAwait<'a> {
+// // pub struct AutoEventAwait<'a> {
 
-// }
+// // }

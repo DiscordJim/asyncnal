@@ -1,21 +1,23 @@
-use std::{collections::VecDeque, sync::Mutex, task::Waker};
+use std::{collections::VecDeque, sync::Mutex, task::{Wake, Waker}};
+
+use lfqueue::UnboundedQueue;
 
 #[derive(Default)]
 pub(crate) struct AsyncLot {
-    inner: Mutex<VecDeque<Waker>>
+    inner: UnboundedQueue<Waker>
 }
 
 impl AsyncLot {
-    pub fn park_front(&self, waker: &Waker) {
-        self.inner.lock().unwrap().push_front(waker.clone());
-    }
     pub fn park(&self, waker: &Waker) {
-        self.inner.lock().unwrap().push_back(waker.clone());
+        self.inner.enqueue(waker.clone());
+        // self.inner.lock().unwrap().push_back(waker.clone());
     }
     pub fn unpark_one(&self) {
-        if let Some(inner) = self.inner.lock().unwrap().pop_front() {
-            inner.wake_by_ref();
+        if let Some(value) = self.try_unpark() {
+            value.wake_by_ref();
         }
-        // self.inner.lock().unwrap().pop_front()
+    }
+    fn try_unpark(&self) -> Option<Waker> {
+        self.inner.dequeue()
     }
 }
