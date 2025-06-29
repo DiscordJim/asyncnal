@@ -1,5 +1,5 @@
 use std::{
-    pin::Pin,
+    pin::{pin, Pin},
     sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll, Waker},
 };
@@ -7,15 +7,14 @@ use std::{
 
 mod atomic;
 
-use crate::async_lot::AsyncLot;
+use crate::{async_lot::AsyncLot, yielder::Yield};
 
 mod async_lot;
-mod atom_lock;
 mod yielder;
 
-const SIGNAL_FREE: u8 = 0x00;
-const SIGNAL_WAIT: u8 = 0x01;
-const SIGNAL_SET: u8 = 0x02;
+const SIGNAL_FREE: u8 = 0b00;
+const SIGNAL_WAIT: u8 = 0b01;
+const SIGNAL_SET: u8 = 0b10;
 
 use crate::atomic::*;
 
@@ -31,9 +30,13 @@ struct RawEvent {
 unsafe impl Send for RawEvent {}
 unsafe impl Sync for RawEvent {}
 
+const BACKOFF_MAX: usize = 3;
+
 pub struct RawEventAwait<'a> {
     event: &'a RawEvent,
     is_parked: bool,
+    backoff: usize,
+    yielder: Option<Yield>
 }
 
 impl<'a> RawEventAwait<'a> {
@@ -49,12 +52,57 @@ impl<'a> RawEventAwait<'a> {
         self.is_parked = true;
         self.event.waker.park(waker);
     }
+    #[inline]
+    fn waker_list(&self) -> &AsyncLot {
+        &self.event.waker
+    }
+
+    #[inline]
+    fn backoff(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.backoff += 1;
+
+        if self.backoff <= BACKOFF_MAX {
+            // Straight up return.
+            core::hint::spin_loop();
+            return self.poll(cx);
+        } else {
+            self.yielder = Some(Yield::default());
+            return self.poll(cx);
+        }
+    }
+
+  
+    #[inline]
+    fn proper_unpark(&self) {
+        let mut new_pattern = SIGNAL_WAIT;
+        if !self.event.waker.unpark_one() {
+            // We failed to unpark the next one, queue should be empty.
+            new_pattern = SIGNAL_FREE;
+
+        }
+
+        // if self.event.inner.compare_exchange_weak(SIGNAL_SET | SIGNAL_WAIT, new_pattern, Ordering::Release, Ordering::Relaxed).is_ok() {
+        //     println!("properly reset...");
+        // }
+    }
 }
 
 impl Future for RawEventAwait<'_> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+
+        if let Some(mut yielder) = self.yielder.take() {
+            match pin!(&mut yielder).poll(cx) {
+                Poll::Pending => {
+                    self.yielder = Some(yielder);
+                },
+                Poll::Ready(()) => {
+                    // here we proceed.
+                }
+            }
+        }
+
         // First we want to check if the signal is set, if so we can just bypass all this checking.
         match self
             .event
@@ -62,20 +110,19 @@ impl Future for RawEventAwait<'_> {
             .compare_exchange_weak(SIGNAL_SET, SIGNAL_FREE, Acquire, Relaxed)
         {
             Ok(_) => {
-                // We've gone through the fast path.
-                if self.is_parked {
-                    // Direct acquisition, we must be at the top of the queue.
-                    self.event.waker.unpark_one();
-                }
-                // Wake up the next person in line (if there is one)
-                self.event.waker.unpark_one();
+                println!("OK PATH");
+                // what if we do self.wakerlist unpark, and then if it returns true we enqueue it? negating the wait bit so that things
+                // that are already parked get priority.
+                let res = self.waker_list().unpark_one();
+                // Optimistic acquisition failure.
+                debug_assert!(!res, "We optimistically acquired the signal but there was another thread in the queue.");
                 return Poll::Ready(()); // We can return.
             }
             Err(x) => {
                 // If we enter this branch then the signal was not set.
                 println!("Tried to swap, read pattern: {:08b}", x);
                 match x {
-                    0b00 => {
+                    SIGNAL_FREE => {
                         // bit pattern of SIGNAL_FREE
                         if self.swap_in(SIGNAL_FREE, SIGNAL_WAIT) {
                             // try to set the bit pattern to waiting.
@@ -83,18 +130,19 @@ impl Future for RawEventAwait<'_> {
                             return Poll::Pending; // return pending as we are waiting
                         } else {
                             // In this case we just retry.
-                            return self.poll(cx);
+                            return self.backoff(cx);
                         }
 
                     },
-                    0b01 => {
+                    SIGNAL_WAIT => {
                         // bit pattern: SIGNAL WAIT
                         self.park_waker(cx.waker());
                         return Poll::Pending;
                     }
-                    0b10 => {
+                    SIGNAL_SET => {
                         // failed spontaneously, try again.
-                        return self.poll(cx);
+                        println!("PATH B/SIGNAL_SET");
+                        return self.backoff(cx);
                     }
                     0b11 => {
                         // Result: The signal is both set & waiting.
@@ -102,7 +150,7 @@ impl Future for RawEventAwait<'_> {
                             // If we are already parked then we must be the top of the queue.
 
                             // ready the next wakeup.
-                            self.event.waker.unpark_one();
+                            self.proper_unpark();
 
                             return Poll::Ready(());
                         } else {
@@ -203,23 +251,29 @@ impl AutoEvent {
             },
         }
     }
+    fn has_waiter(&self) -> bool {
+        self.inner.inner.load(Acquire) & SIGNAL_WAIT != 0
+    }
     pub fn wait(&self) -> RawEventAwait<'_> {
         RawEventAwait {
             event: &self.inner,
             is_parked: false,
+            backoff: 0,
+            yielder: None
         }
     }
-    pub fn wake(&self) {
+    pub fn set_one(&self) {
         let state = self.inner.inner.load(Ordering::Acquire);
         self.inner.inner.store(state | SIGNAL_SET, Ordering::SeqCst);
         self.inner.waker.unpark_one();
+    
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{atomic::Ordering, Arc},
         thread::{self, current, sleep},
         time::Duration,
     };
@@ -228,7 +282,7 @@ mod tests {
     use rsevents::{AutoResetEvent, Awaitable};
     use tokio::sync::Barrier;
 
-    use crate::AutoEvent;
+    use crate::{AutoEvent, SIGNAL_FREE, SIGNAL_WAIT};
 
     // struct Test {
     //     link: LinkedListAtomicLink,
@@ -324,7 +378,7 @@ mod tests {
 
         for i in 0..10 {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            signal.wake();
+            signal.set_one();
         }
 
         for v in bucket {
@@ -333,6 +387,72 @@ mod tests {
 
         // signal.wait().await;
     }
+
+
+ 
+    
+
+
+    #[tokio::test]
+    pub async fn proper_wait_to_free_reset() {
+        // Checks if the waiting bit is unset correctly.
+        let event = Arc::new(AutoEvent::new());
+
+        // should be the free bit.
+        assert_eq!(event.inner.inner.load(std::sync::atomic::Ordering::Relaxed), SIGNAL_FREE);
+
+
+        // spawn a waiter.
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        tokio::spawn({
+            let event = event.clone();
+            let barrier = barrier.clone();
+            async move {
+                event.wait().await;
+                barrier.wait().await;
+            }
+        });
+
+        loop {
+            // check for it to be active
+
+            if event.inner.inner.load(Ordering::Acquire) & SIGNAL_WAIT != 0 {
+                println!("the wait bit has been set...");
+                break; // break out of loop!
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // now we set the event.
+        event.set_one();
+
+        // let the other thread see it.
+        barrier.wait().await;
+
+        // should be fully freed!
+        assert_eq!(event.inner.inner.load(Ordering::Acquire), SIGNAL_FREE);
+
+
+    }
+    
+
+    #[tokio::test]
+    pub async fn test_optimistic_acquire() {
+        // checks if we can optimistically acquire the event & that it is properly reset.
+        let waker = AutoEvent::new();
+        
+        // release a notification.
+        waker.set_one();
+
+        // acquire the vent.
+        waker.wait().await;
+
+        // should be properly reset.
+        assert_eq!(waker.inner.inner.load(Ordering::SeqCst), SIGNAL_FREE);
+    }
+
 }
 
 // // pub struct AutoEventAwait<'a> {

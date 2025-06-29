@@ -67,6 +67,7 @@ dependencies = [
  "haphazard",
  "lfqueue",
  "lockfree",
+ "loom",
  "owned-alloc",
  "rsevents",
  "tokio",
