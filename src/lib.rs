@@ -18,10 +18,10 @@ const SIGNAL_SET: u8 = 0b10;
 
 use crate::atomic::*;
 
-trait EventSetter {
-    type Waiter: Future<Output = ()> + Unpin;
+trait EventSetter<'a> {
+    type Waiter: Future<Output = ()> + 'a + Unpin;
 
-    fn wait(&self) -> Self::Waiter;
+    fn wait(&'a self) -> Self::Waiter;
     fn set_one(&self) -> bool;
     fn set_all<F: FnMut()>(&self, functor: F);
 }
@@ -195,17 +195,19 @@ impl Event {
         }
     }
     pub fn wait(&self) -> RawEventAwait<'_> {
-        <&Self as EventSetter>::wait(&self)
+        <Self as EventSetter>::wait(&self)
     }
     pub fn set_all(&self) {
-        <&Self as EventSetter>::set_all(&self, || {});
+        <Self as EventSetter>::set_all(&self, || {});
     }
     pub fn set_one(&self) {
-        <&Self as EventSetter>::set_one(&self);
+        <Self as EventSetter>::set_one(&self);
     }
 }
 
-impl<'a> EventSetter for &'a Event
+impl<'a> EventSetter<'a> for Event
+where 
+    Self: 'a
 {
     type Waiter = RawEventAwait<'a>;
 
@@ -221,7 +223,7 @@ impl<'a> EventSetter for &'a Event
         self.inner.waker.unpark_one()
     }
     
-    fn wait(&self) -> Self::Waiter {
+    fn wait(&'a self) -> Self::Waiter {
         RawEventAwait {
             event: &self.inner,
             is_parked: false,
@@ -240,7 +242,7 @@ pin_project! {
     #[allow(private_bounds)]
     pub struct CountedAwaiter<'a, E, F>
     where
-        &'a E: EventSetter,
+        E: EventSetter<'a>,
         F: Future<Output = ()>
     {
         master: &'a CountedEvent<E>,
@@ -254,18 +256,28 @@ pin_project! {
 
 impl<'a, E, F> Future for CountedAwaiter<'a, E, F>
 where 
-    E: EventSetter,
+    E: EventSetter<'a>,
     F: Future<Output = ()> + Unpin
 {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        println!("I GOT POLLED!!!");
         let this = self.project();
         if *this.is_done {
-            return this.future.poll(cx);
+            match this.future.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    this.master.counter.fetch_sub(1, Ordering::Release);
+                    return Poll::Ready(());
+                }
+            }
         } else {
+            println!("intering...");
             let result = this.future.poll(cx);
+            println!("entering...");
             *this.is_done = true;
             this.master.counter.fetch_add(1, Ordering::Release);
+            println!("entering... {}", this.master.counter.load(Ordering::Acquire));
             return result;
         }
     }
@@ -275,7 +287,7 @@ where
 #[allow(private_bounds)]
 impl<E> CountedEvent<E>
 where 
-    for<'a> &'a E: EventSetter
+    for<'a> E: EventSetter<'a>
 {
     #[allow(private_interfaces)]
     pub fn new(source: E) -> Self {
@@ -286,31 +298,35 @@ where
     } 
 
     #[allow(private_interfaces)]
-    pub fn wait(&self) -> <&Self as EventSetter>::Waiter {
-        <&Self as EventSetter>::wait(&self)
+    pub fn wait(&self) -> <Self as EventSetter>::Waiter {
+        <Self as EventSetter>::wait(&self)
     }
 
     #[allow(private_interfaces)]
     pub fn set_one(&self) {
-        <&Self as EventSetter>::set_one(&self);
+        <Self as EventSetter>::set_one(&self);
     }
 
     #[allow(private_interfaces)]
     pub fn set_all(&self) {
-        <&Self as EventSetter>::set_all(&self, || {});
+        <Self as EventSetter>::set_all(&self, || {});
+    }
+
+    pub fn count(&self) -> usize {
+        self.counter.load(Acquire)
     }
 }
 
 
-impl<'a, E> EventSetter for &'a CountedEvent<E>
+impl<'a, E> EventSetter<'a> for CountedEvent<E>
 where 
-    &'a E: EventSetter
+    E: EventSetter<'a> + 'a
 {
 
-    type Waiter = CountedAwaiter<'a, E, <&'a E as EventSetter>::Waiter>;
+    type Waiter = CountedAwaiter<'a, E, E::Waiter>;
 
-    fn wait(&self) -> CountedAwaiter<'a, E, E::Waiter> {
-        
+    fn wait(&'a self) -> CountedAwaiter<'a, E, E::Waiter> {
+        // self.counter.fetch_add(1, Release);
         CountedAwaiter { master: self, future: self.inner.wait(), is_done: false }
 
     }
@@ -323,7 +339,7 @@ where
     }
     fn set_one(&self) -> bool {
         if self.inner.set_one() {
-            self.counter.fetch_sub(1, Ordering::Release);
+            // self.counter.fetch_sub(1, Ordering::Release);
             true
         } else {
             false
@@ -502,9 +518,44 @@ mod tests {
  
 
 
+    async fn wait_loop<F: FnMut() -> bool>(mut functor: F) {
+
+        loop {
+            if functor() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     pub async fn counted_waiter_single() {
-        let waiter = Arc::new(CountedEvent)
+        let waiter = Arc::new(CountedEvent::new(Event::new()));
+
+        assert_eq!(waiter.count(), 0);
+
+
+        tokio::spawn({
+            let waiter = waiter.clone();
+            async move {
+                waiter.wait().await;
+            }
+        });
+
+
+        // Wait until the count is not zero.
+        wait_loop(|| waiter.count() != 0).await;
+
+
+        // Wake up this thread.
+        waiter.set_one();
+
+        // Wait until it is zero again.
+        wait_loop(|| waiter.count() == 0).await;
+
+
+
+
     }
     
     
