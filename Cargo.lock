@@ -69,6 +69,7 @@ dependencies = [
  "lockfree",
  "loom",
  "owned-alloc",
+ "pin-project-lite",
  "rsevents",
  "tokio",
 ]

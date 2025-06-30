@@ -1,9 +1,11 @@
 use std::{
-    ops::ControlFlow, pin::{pin, Pin}, sync::atomic::{AtomicU8, Ordering}, task::{Context, Poll, Waker}
+    ops::ControlFlow, pin::{pin, Pin}, sync::atomic::{AtomicU8, AtomicUsize, Ordering}, task::{Context, Poll, Waker}
 };
 
 
 mod atomic;
+
+use pin_project_lite::pin_project;
 
 use crate::{async_lot::AsyncLot, yielder::Yield};
 
@@ -15,6 +17,14 @@ const SIGNAL_FREE: u8 = 0b00;
 const SIGNAL_SET: u8 = 0b10;
 
 use crate::atomic::*;
+
+trait EventSetter {
+    type Waiter: Future<Output = ()> + Unpin;
+
+    fn wait(&self) -> Self::Waiter;
+    fn set_one(&self) -> bool;
+    fn set_all<F: FnMut()>(&self, functor: F);
+}
 
 pub struct Event {
     inner: RawEvent,
@@ -185,6 +195,33 @@ impl Event {
         }
     }
     pub fn wait(&self) -> RawEventAwait<'_> {
+        <&Self as EventSetter>::wait(&self)
+    }
+    pub fn set_all(&self) {
+        <&Self as EventSetter>::set_all(&self, || {});
+    }
+    pub fn set_one(&self) {
+        <&Self as EventSetter>::set_one(&self);
+    }
+}
+
+impl<'a> EventSetter for &'a Event
+{
+    type Waiter = RawEventAwait<'a>;
+
+    fn set_all<F: FnMut()>(&self, mut f: F) {
+        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
+        while self.inner.waker.unpark_one() {
+            // unpark them all.
+            f();
+        }
+    }
+    fn set_one(&self) -> bool {
+        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
+        self.inner.waker.unpark_one()
+    }
+    
+    fn wait(&self) -> Self::Waiter {
         RawEventAwait {
             event: &self.inner,
             is_parked: false,
@@ -192,18 +229,108 @@ impl Event {
             yielder: None
         }
     }
-    /// Sets an event if it is available.
-    pub fn set_one(&self) {
-        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
-        self.inner.waker.unpark_one();
-    }
+}
 
-    pub fn set_all(&self) {
-        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
-        while self.inner.waker.unpark_one() {
-            // unpark them all.
+pub struct CountedEvent<E> {
+    inner: E,
+    counter: AtomicUsize
+}
+
+pin_project! {
+    #[allow(private_bounds)]
+    pub struct CountedAwaiter<'a, E, F>
+    where
+        &'a E: EventSetter,
+        F: Future<Output = ()>
+    {
+        master: &'a CountedEvent<E>,
+        #[pin]
+        future: F,
+        is_done: bool
+        
+    }
+}
+
+
+impl<'a, E, F> Future for CountedAwaiter<'a, E, F>
+where 
+    E: EventSetter,
+    F: Future<Output = ()> + Unpin
+{
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if *this.is_done {
+            return this.future.poll(cx);
+        } else {
+            let result = this.future.poll(cx);
+            *this.is_done = true;
+            this.master.counter.fetch_add(1, Ordering::Release);
+            return result;
         }
     }
+}
+
+
+#[allow(private_bounds)]
+impl<E> CountedEvent<E>
+where 
+    for<'a> &'a E: EventSetter
+{
+    #[allow(private_interfaces)]
+    pub fn new(source: E) -> Self {
+        Self {
+            inner: source,
+            counter: AtomicUsize::new(0)
+        }
+    } 
+
+    #[allow(private_interfaces)]
+    pub fn wait(&self) -> <&Self as EventSetter>::Waiter {
+        <&Self as EventSetter>::wait(&self)
+    }
+
+    #[allow(private_interfaces)]
+    pub fn set_one(&self) {
+        <&Self as EventSetter>::set_one(&self);
+    }
+
+    #[allow(private_interfaces)]
+    pub fn set_all(&self) {
+        <&Self as EventSetter>::set_all(&self, || {});
+    }
+}
+
+
+impl<'a, E> EventSetter for &'a CountedEvent<E>
+where 
+    &'a E: EventSetter
+{
+
+    type Waiter = CountedAwaiter<'a, E, <&'a E as EventSetter>::Waiter>;
+
+    fn wait(&self) -> CountedAwaiter<'a, E, E::Waiter> {
+        
+        CountedAwaiter { master: self, future: self.inner.wait(), is_done: false }
+
+    }
+
+    fn set_all<F: FnMut()>(&self, mut functor: F) {
+        self.inner.set_all(|| {
+            functor();
+            self.counter.fetch_sub(1, Ordering::Release);
+        });
+    }
+    fn set_one(&self) -> bool {
+        if self.inner.set_one() {
+            self.counter.fetch_sub(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+
 }
 
 
@@ -225,7 +352,7 @@ mod tests {
     // use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
     use tokio::sync::Barrier;
 
-    use crate::{Event, SIGNAL_FREE};
+    use crate::{CountedEvent, Event, EventSetter, SIGNAL_FREE};
 
     // struct Test {
     //     link: LinkedListAtomicLink,
@@ -374,6 +501,11 @@ mod tests {
 
  
 
+
+    #[tokio::test]
+    pub async fn counted_waiter_single() {
+        let waiter = Arc::new(CountedEvent)
+    }
     
     
 
