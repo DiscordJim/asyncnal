@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Mutex, task::{Wake, Waker}};
+use std::task::Waker;
 
 use lfqueue::UnboundedQueue;
 
@@ -10,7 +10,6 @@ pub(crate) struct AsyncLot {
 impl AsyncLot {
     pub fn park(&self, waker: &Waker) {
         self.inner.enqueue(waker.clone());
-        // self.inner.lock().unwrap().push_back(waker.clone());
     }
     pub fn unpark_one(&self) -> bool {
         if let Some(value) = self.try_unpark() {

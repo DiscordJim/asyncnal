@@ -1,7 +1,5 @@
 use std::{
-    pin::{pin, Pin},
-    sync::atomic::{AtomicU8, Ordering},
-    task::{Context, Poll, Waker},
+    ops::ControlFlow, pin::{pin, Pin}, sync::atomic::{AtomicU8, Ordering}, task::{Context, Poll, Waker}
 };
 
 
@@ -13,12 +11,12 @@ mod async_lot;
 mod yielder;
 
 const SIGNAL_FREE: u8 = 0b00;
-const SIGNAL_WAIT: u8 = 0b01;
+// const SIGNAL_WAIT: u8 = 0b01;
 const SIGNAL_SET: u8 = 0b10;
 
 use crate::atomic::*;
 
-pub struct AutoEvent {
+pub struct Event {
     inner: RawEvent,
 }
 
@@ -40,13 +38,6 @@ pub struct RawEventAwait<'a> {
 }
 
 impl<'a> RawEventAwait<'a> {
-    #[inline]
-    fn swap_in(&self, current: u8, new: u8) -> bool {
-        self.event
-            .inner
-            .compare_exchange_weak(current, new, Acquire, Relaxed)
-            .is_ok()
-    }
     #[inline]
     fn park_waker(&mut self, waker: &Waker) {
         self.is_parked = true;
@@ -71,20 +62,38 @@ impl<'a> RawEventAwait<'a> {
         }
     }
 
-  
+
     #[inline]
-    fn proper_unpark(&self) {
-        let mut new_pattern = SIGNAL_WAIT;
-        if !self.event.waker.unpark_one() {
-            // We failed to unpark the next one, queue should be empty.
-            new_pattern = SIGNAL_FREE;
-
+    fn try_yield(&mut self, cx: &mut Context<'_>) -> ControlFlow<()> {
+        if let Some(mut yielder) = self.yielder.take() {
+            match pin!(&mut yielder).poll(cx) {
+                Poll::Pending => {
+                    self.yielder = Some(yielder);
+                    ControlFlow::Continue(())
+                },
+                Poll::Ready(()) => {
+                    // here we proceed.
+                    ControlFlow::Break(())
+                }
+            }
+        } else {
+            ControlFlow::Break(())
         }
-
-        // if self.event.inner.compare_exchange_weak(SIGNAL_SET | SIGNAL_WAIT, new_pattern, Ordering::Release, Ordering::Relaxed).is_ok() {
-        //     println!("properly reset...");
-        // }
     }
+  
+    // #[inline]
+    // fn proper_unpark(&self) {
+    //     // let mut new_pattern = SIGNAL_WAIT;
+    //     if !self.event.waker.unpark_one() {
+    //         // We failed to unpark the next one, queue should be empty.
+    //         // new_pattern = SIGNAL_FREE;
+
+    //     }
+
+    //     // if self.event.inner.compare_exchange_weak(SIGNAL_SET | SIGNAL_WAIT, new_pattern, Ordering::Release, Ordering::Relaxed).is_ok() {
+    //     //     println!("properly reset...");
+    //     // }
+    // }
 }
 
 impl Future for RawEventAwait<'_> {
@@ -92,15 +101,10 @@ impl Future for RawEventAwait<'_> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 
-        if let Some(mut yielder) = self.yielder.take() {
-            match pin!(&mut yielder).poll(cx) {
-                Poll::Pending => {
-                    self.yielder = Some(yielder);
-                },
-                Poll::Ready(()) => {
-                    // here we proceed.
-                }
-            }
+        // Here we check if we are yielding, this is an asynchronous version of
+        // backoff. If this returns `Continue` then we must poll again.
+        if let ControlFlow::Continue(()) = self.try_yield(cx) {
+            return Poll::Pending;
         }
 
         // First we want to check if the signal is set, if so we can just bypass all this checking.
@@ -110,55 +114,59 @@ impl Future for RawEventAwait<'_> {
             .compare_exchange_weak(SIGNAL_SET, SIGNAL_FREE, Acquire, Relaxed)
         {
             Ok(_) => {
-                println!("OK PATH");
-                // what if we do self.wakerlist unpark, and then if it returns true we enqueue it? negating the wait bit so that things
-                // that are already parked get priority.
-                let res = self.waker_list().unpark_one();
-                // Optimistic acquisition failure.
-                debug_assert!(!res, "We optimistically acquired the signal but there was another thread in the queue.");
-                return Poll::Ready(()); // We can return.
+                // The optimistic path has succeeded, this means we came in just as the signal was set (already set).
+                // For this to be fair, we can only return here if there are no other threads enqueued. If there are
+                // other threads enqueued and we were to return here then the last person to the critical section wins,
+                // and that is not fair.
+
+                // The exception is if we were already parked. In this case, we can just unpark the next thread and then return ourselves.
+                if self.is_parked {
+                    return Poll::Ready(());
+                }
+
+                // SOLUTION:
+                // Here we unpark a thread, this will tell us if there is another thread or not. If there is,
+                // then we will add the current thread into the queue so that this is fair.
+                if self.waker_list().unpark_one() {
+                    // In this case there was another thread already there, therefore we must park the current thread.
+                    self.park_waker(cx.waker());
+                    return Poll::Pending;
+                } else {
+                    // There was nothing there, thus we are exclusive and
+                    // can immediately return. 
+                    return Poll::Ready(());
+                }
             }
             Err(x) => {
-                // If we enter this branch then the signal was not set.
-                println!("Tried to swap, read pattern: {:08b}", x);
                 match x {
                     SIGNAL_FREE => {
-                        // bit pattern of SIGNAL_FREE
-                        if self.swap_in(SIGNAL_FREE, SIGNAL_WAIT) {
-                            // try to set the bit pattern to waiting.
-                            self.park_waker(cx.waker());
-                            return Poll::Pending; // return pending as we are waiting
-                        } else {
-                            // In this case we just retry.
-                            return self.backoff(cx);
+
+                        // We need to recognize the case in which we were PREVIOUSLY parked and
+                        // are no longer parked. In this case we were awakened on a set, and the
+                        // bit was cleared in the meantime.
+                        //
+                        // This sort of situation can often happen when two `set()` calls are made back
+                        // to back. In this case let's say Thread A & B are enqueued. Then the first set() call
+                        // wakes `A`, `A` unsets the bit, and then when thread `B` is polled it believes it
+                        // was called by mistake. Thus, we return here.
+                        if self.is_parked {
+                            return Poll::Ready(());
                         }
 
-                    },
-                    SIGNAL_WAIT => {
-                        // bit pattern: SIGNAL WAIT
+                        // We can park ourselves.
                         self.park_waker(cx.waker());
                         return Poll::Pending;
                     }
                     SIGNAL_SET => {
-                        // failed spontaneously, try again.
-                        println!("PATH B/SIGNAL_SET");
+                        // If this is set, then this means there was
+                        // a spurious failure. In this case we can backoff and try agian.
                         return self.backoff(cx);
                     }
-                    0b11 => {
-                        // Result: The signal is both set & waiting.
-                        if self.is_parked {
-                            // If we are already parked then we must be the top of the queue.
-
-                            // ready the next wakeup.
-                            self.proper_unpark();
-
-                            return Poll::Ready(());
-                        } else {
-                            self.park_waker(cx.waker());
-                            return Poll::Pending;
-                        }
+                    _ => {
+                        // SAFETY: We only ever mess with the first bit.
+                        debug_assert!(false, "Entered the unreachable zone!");
+                        unsafe { std::hint::unreachable_unchecked() };
                     }
-                    _ => unreachable!()
                 }
                 
             }
@@ -166,83 +174,8 @@ impl Future for RawEventAwait<'_> {
     }
 }
 
-// impl Future for RawEventAwait<'_> {
-//     type Output = ();
-//     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         // println!("Getting polled...");
-//         // This is a similar optimization that is applied in the AutoResetEvents from the `rsevents` crate, basically if the flag is
-//         // set and the signal is not contended then we immediately can poll [Poll::Ready].
-//         match self.event.inner.compare_exchange_weak(SIGNAL_SET, SIGNAL_FREE, Ordering::Acquire, Ordering::Relaxed) {
-//             Ok(_) => {
-//                 // println!("Fast path...");
-//                 if self.is_parked {
-//                     // println!("Fast path live. Double popping the queue.");
-//                     self.event.waker.unpark_one();
-//                 }
-//                 self.event.waker.unpark_one();
-//                 return Poll::Ready(())
-//             }
-//             Err(current) => {
-//                 // The bit pattern is restricted to the first tow.
-//                 debug_assert_eq!(current & !0x3, 0);
 
-//                 match current {
-//                     SIGNAL_FREE => {
-//                         if self.swap_in(SIGNAL_FREE, SIGNAL_WAIT) {
-//                             self.is_parked = true;
-//                             self.event.waker.park_front(cx.waker());
-//                             return Poll::Pending;
-//                         }
-
-//                     }
-//                     SIGNAL_WAIT => {
-//                         /* We let the control flow fall through here, we will be scheduled for wakeup automatically at the end of the match. */
-//                     }
-//                     0b11 => {
-//                         if self.is_parked {
-//                             // If we are already parked then the following conditions must be true:
-//                             // 1. We have already scheduled ourselves.
-//                             // 2. We were called in order.
-
-//                             // This kicks us off the stack.
-//                             self.event.waker.unpark_off_stack();
-
-//                             if self.event.waker.len() == 0 {
-//                                 // println!("FULLY FREEING THE SIGNAL!!");
-//                                 // Since there is nothing let in the queue, the signal is fully free.
-//                                 self.event.inner.store(SIGNAL_FREE, Ordering::Release);
-//                             } else {
-//                                 // Since the pattern is SIGNAL_SET | SIGNAL_WAIT, we want to unset
-//                                 // the SET bit, but we do not want new people jumping to the top of the
-//                                 // queue so we leave the wait bit set.
-//                                 self.event.inner.store(SIGNAL_WAIT, Ordering::Release);
-//                             }
-
-//                             self.event.waker.unpark_one();
-//                             return Poll::Ready(());
-//                         }
-//                     }
-//                     SIGNAL_SET => {
-//                         // if
-//                         println!("SIGNAL SET??");
-//                     }
-//                     x => panic!("Invalid bit pattern: {x:08b}")
-//                 }
-
-//                 if !self.is_parked {
-//                     self.is_parked = true;
-//                     self.event.waker.park(cx.waker());
-//                 }
-
-//                 // This is the failure path, basically if the current op did not work
-//                 // we fall back into the pending state.
-//                 Poll::Pending
-//             }
-//         }
-//     }
-// }
-
-impl AutoEvent {
+impl Event {
     pub fn new() -> Self {
         Self {
             inner: RawEvent {
@@ -250,9 +183,6 @@ impl AutoEvent {
                 waker: AsyncLot::default(),
             },
         }
-    }
-    fn has_waiter(&self) -> bool {
-        self.inner.inner.load(Acquire) & SIGNAL_WAIT != 0
     }
     pub fn wait(&self) -> RawEventAwait<'_> {
         RawEventAwait {
@@ -262,11 +192,25 @@ impl AutoEvent {
             yielder: None
         }
     }
+    /// Sets an event if it is available.
     pub fn set_one(&self) {
-        let state = self.inner.inner.load(Ordering::Acquire);
-        self.inner.inner.store(state | SIGNAL_SET, Ordering::SeqCst);
+        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
         self.inner.waker.unpark_one();
-    
+    }
+
+    pub fn set_all(&self) {
+        self.inner.inner.store(SIGNAL_SET, Ordering::Release);
+        while self.inner.waker.unpark_one() {
+            // unpark them all.
+        }
+    }
+}
+
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // on drop all the taks are set.
+        self.set_all();
     }
 }
 
@@ -274,15 +218,14 @@ impl AutoEvent {
 mod tests {
     use std::{
         sync::{atomic::Ordering, Arc},
-        thread::{self, current, sleep},
+        thread::sleep,
         time::Duration,
     };
 
     // use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
-    use rsevents::{AutoResetEvent, Awaitable};
     use tokio::sync::Barrier;
 
-    use crate::{AutoEvent, SIGNAL_FREE, SIGNAL_WAIT};
+    use crate::{Event, SIGNAL_FREE};
 
     // struct Test {
     //     link: LinkedListAtomicLink,
@@ -347,8 +290,8 @@ mod tests {
     // }
 
     #[tokio::test]
-    pub async fn waiter_async() {
-        let signal = Arc::new(AutoEvent::new());
+    pub async fn waiter_async_set_one() {
+        let signal = Arc::new(Event::new());
         let barrier = Arc::new(Barrier::new(11));
 
         let waiters = 10;
@@ -377,7 +320,7 @@ mod tests {
         println!("Barrier fully done...");
 
         for i in 0..10 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // tokio::time::sleep(Duration::from_millis(10)).await;
             signal.set_one();
         }
 
@@ -389,59 +332,101 @@ mod tests {
     }
 
 
+
+    #[tokio::test]
+    pub async fn waiter_async_set_all() {
+        let signal = Arc::new(Event::new());
+        let barrier = Arc::new(Barrier::new(11));
+
+        let waiters = 10;
+        let mut bucket = vec![];
+
+        for i in 0..waiters {
+            bucket.push(tokio::spawn({
+                let signal = signal.clone();
+                let barrier = barrier.clone();
+                async move {
+                    println!("Task {i} waiting...");
+                    barrier.wait().await;
+
+                    signal.wait().await;
+                    println!("Wake;... {i}");
+                    // signal.wake();
+                }
+            }));
+            // sleep(Duration::from_secs(1)).await;
+        }
+
+        // sleep(Duration::from_secs(1)).await;
+
+        barrier.wait().await;
+        sleep(Duration::from_millis(10));
+        println!("Barrier fully done...");
+
+        signal.set_all();
+
+        for v in bucket {
+            v.await.unwrap();
+        }
+
+        // signal.wait().await;
+    }
+
  
+
+    
     
 
 
-    #[tokio::test]
-    pub async fn proper_wait_to_free_reset() {
-        // Checks if the waiting bit is unset correctly.
-        let event = Arc::new(AutoEvent::new());
+    // #[tokio::test]
+    // pub async fn proper_wait_to_free_reset() {
+    //     // Checks if the waiting bit is unset correctly.
+    //     let event = Arc::new(AutoEvent::new());
 
-        // should be the free bit.
-        assert_eq!(event.inner.inner.load(std::sync::atomic::Ordering::Relaxed), SIGNAL_FREE);
-
-
-        // spawn a waiter.
-
-        let barrier = Arc::new(Barrier::new(2));
-
-        tokio::spawn({
-            let event = event.clone();
-            let barrier = barrier.clone();
-            async move {
-                event.wait().await;
-                barrier.wait().await;
-            }
-        });
-
-        loop {
-            // check for it to be active
-
-            if event.inner.inner.load(Ordering::Acquire) & SIGNAL_WAIT != 0 {
-                println!("the wait bit has been set...");
-                break; // break out of loop!
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-
-        // now we set the event.
-        event.set_one();
-
-        // let the other thread see it.
-        barrier.wait().await;
-
-        // should be fully freed!
-        assert_eq!(event.inner.inner.load(Ordering::Acquire), SIGNAL_FREE);
+    //     // should be the free bit.
+    //     assert_eq!(event.inner.inner.load(std::sync::atomic::Ordering::Relaxed), SIGNAL_FREE);
 
 
-    }
+    //     // spawn a waiter.
+
+    //     let barrier = Arc::new(Barrier::new(2));
+
+    //     tokio::spawn({
+    //         let event = event.clone();
+    //         let barrier = barrier.clone();
+    //         async move {
+    //             event.wait().await;
+    //             barrier.wait().await;
+    //         }
+    //     });
+
+    //     loop {
+    //         // check for it to be active
+
+    //         if event.inner.inner.load(Ordering::Acquire) & SIGNAL_WAIT != 0 {
+    //             println!("the wait bit has been set...");
+    //             break; // break out of loop!
+    //         }
+    //         tokio::time::sleep(Duration::from_millis(1)).await;
+    //     }
+
+    //     // now we set the event.
+    //     event.set_one();
+
+    //     // let the other thread see it.
+    //     barrier.wait().await;
+
+    //     // should be fully freed!
+    //     assert_eq!(event.inner.inner.load(Ordering::Acquire), SIGNAL_FREE);
+
+
+    // }
     
 
     #[tokio::test]
     pub async fn test_optimistic_acquire() {
         // checks if we can optimistically acquire the event & that it is properly reset.
-        let waker = AutoEvent::new();
+        let waker = Event::new();
         
         // release a notification.
         waker.set_one();
