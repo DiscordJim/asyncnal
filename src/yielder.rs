@@ -1,5 +1,5 @@
-use std::{
-    pin::Pin, sync::Mutex, task::{Context, Poll}, time::Duration
+use core::{
+    pin::Pin, task::{Context, Poll}
 };
 
 
