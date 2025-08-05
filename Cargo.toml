@@ -1,6 +1,6 @@
 [package]
 name = "asyncnal"
-version = "0.1.1"
+version = "0.2.1"
 edition = "2024"
 description = "Fast concurrent & local asyncronous signalling"
 license-file = "LICENSE"
