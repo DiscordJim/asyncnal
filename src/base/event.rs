@@ -7,16 +7,47 @@ use core::{
 
 use core::future::Future;
 
+
+/// Describes an event interface that can be created in
+/// a set or unset state and can be waited upon. 
+/// 
+/// Implementing this wrong in and of itself will not cause
+/// any undefined behaviour, but great caution should be taken
+/// in which events you rely on for your asynchronous primitives.
+/// 
+/// For instance, if you are writing a mutex and are depending
+/// on an unsound implementation of an [EventSetter], this could
+/// cause immediate and catastrophic undefined behaviour.
 pub trait EventSetter<'a> {
+    /// The future representing a pending acquisition of the event.
     type Waiter: Future<Output = ()> + 'a + Unpin;
 
+    /// Creates a new event in the unset state. This
+    /// is the expected mode of operation for most events,
+    /// and means that if a task begins waiting, they will
+    /// wait until the event is set.
     fn new() -> Self;
+    /// Creates an event in the set state. This means that the event
+    /// can be immediately acquired.
     fn new_set() -> Self;
+    /// Waits on the event. This returns a future which when polled
+    /// will wait for the event to be acquired.
     fn wait(&'a self) -> Self::Waiter;
+    /// Sets the event. This will wake up any events from the queue if
+    /// any are pending. This returns a boolean if we were able to actually
+    /// wake up an event or not.
     fn set_one(&self) -> bool;
-    fn try_wait(&self) -> bool;
-    fn has_waiters(&self) -> bool;
+    /// Sets the event and wakes up all events from the queue if they
+    /// are pending with the functor. This functor allows more advanced book-keeping
+    /// per event, for instance with counted events.
     fn set_all<F: FnMut()>(&self, functor: F);
+    /// Will try to immediately acquire the event along the fast path. This
+    /// method is non-blocking and will return true if we could acquire the event,
+    /// and false if we cannot. This will clear the set flag.
+    fn try_wait(&self) -> bool;
+    /// If the event has any pending waiters.
+    fn has_waiters(&self) -> bool;
+   
 }
 
 
@@ -202,7 +233,7 @@ where
 
                     _ => {
                         // SAFETY: Only the first bit is ever altered.
-                        unsafe { std::hint::unreachable_unchecked() };
+                        unsafe { core::hint::unreachable_unchecked() };
                     }
                 }
             }
@@ -235,16 +266,24 @@ where
 
     #[inline]
     fn set_all<F: FnMut()>(&self, mut functor: F) {
-        self.state.store(SIGNAL_SET, Release);
+        let mut did_signal = false;
         while self.lot.unpark_one() {
+            did_signal = true;
             functor();
+        }
+        if !did_signal {
+            self.state.store(SIGNAL_SET, Release);
         }
     }
 
     #[inline]
     fn set_one(&self) -> bool {
-        self.state.store(SIGNAL_SET, Release);
-        self.lot.unpark_one()
+        if !self.lot.unpark_one() {
+            self.state.store(SIGNAL_SET, Release);
+            false
+        } else {
+            true
+        }
     }
 
     #[inline]
@@ -323,7 +362,7 @@ where
     }
 }
 
-#[macro_export]
+
 macro_rules! impl_async_event {
     (
         name = $name:ident,
@@ -393,6 +432,14 @@ macro_rules! impl_async_event {
             }
 
         }
+
+        impl Default for $name {
+            fn default() -> Self {
+                <Self as crate::EventSetter>::new()
+            }
+
+        }
     };
 }
 
+pub(crate) use impl_async_event;

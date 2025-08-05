@@ -2,11 +2,23 @@
 name = "asyncnal"
 version = "0.1.0"
 edition = "2024"
+description = "Fast concurrent & local asyncronous signalling"
+license-file = "LICENSE"
+repository = "https://github.com/DiscordJim/asyncnal"
+
+
+[features]
+default = ["std"]
+std = ["lfqueue/std"]
+portable-atomic = [ "dep:portable-atomic", "lfqueue/portable-atomic" ]
 
 [dependencies]
 crossbeam-utils = "0.8.21"
-lfqueue = "0.8.1"
+lfqueue = { version = "0.8.1", default-features = false }
 pin-project = "1.1.10"
+portable-atomic = { version = "1.11.1", optional = true }
+
+
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async", "async_tokio"] }

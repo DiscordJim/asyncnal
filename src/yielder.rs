@@ -3,13 +3,15 @@ use core::{
 };
 
 
+/// An asynchronous Yield. This was largely just 
+/// an implementation of Yield from the [smol](https://docs.rs/smol/latest/smol/future/struct.YieldNow.html)
+/// crate.
 #[derive(Default)]
 #[repr(transparent)]
 pub struct Yield {
     state: bool,
 }
 
-// TODO: give credit to smol here.
 impl Future for Yield {
     type Output = ();
 

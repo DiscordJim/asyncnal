@@ -57,6 +57,7 @@ dependencies = [
  "loom",
  "pin-project",
  "pollster",
+ "portable-atomic",
  "rsevents",
 ]
 
@@ -410,6 +411,7 @@ dependencies = [
  "crossbeam-utils",
  "haphazard",
  "loom",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -585,6 +587,12 @@ name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
+name = "portable-atomic"
+version = "1.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
 name = "proc-macro2"

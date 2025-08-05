@@ -1,9 +1,6 @@
-use std::{marker::PhantomData, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc}, task::{Context, Waker}};
+use core::{marker::PhantomData, task::Waker};
 
-use crossbeam_utils::CachePadded;
-use lfqueue::UnboundedQueue;
-
-use crate::base::signal::{TechnicalCounter, TechnicalWaker, ValidityMarker, WakeQueue};
+use crate::base::signal::{TechnicalCounter, ValidityMarker, WakeQueue};
 
 
 pub(crate) struct AsyncLotTemplate<V, C, Q>
@@ -110,7 +107,6 @@ where
 }
 
 
-#[macro_export]
 macro_rules! impl_async_lot {
     (
         name = $name:ident,
@@ -156,3 +152,5 @@ macro_rules! impl_async_lot {
         }
     };
 }
+
+pub(crate) use impl_async_lot;

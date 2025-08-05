@@ -1,252 +1,258 @@
-use std::{
-    ops::ControlFlow,
-    pin::{Pin, pin},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll, Waker},
-};
+//! # Overview
+//! This crate provides executor-agnostic async signalling primitives for building
+//! more complex asynchronous datastructures. They are designed to be lightweight and
+//! extremely easy to use. The documentation contains many examples on how to apply them
+//! to a variety of situations. There also exists local varieties for runtimes that are `!Send`
+//! and `!Sync`.
+//! 
+//! The inspiration from the crate is two-fold. First, the excellent synchronous event notification
+//! mechansism [rsevents](https://docs.rs/rsevents/latest/rsevents/). Additionally, Tokio's [Notify](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html) primitive.
+//! The main difference being that this crate is very lightweight and can be brought in without bringing
+//! in the entire Tokio runtime.
+//! 
+//! It can be thought of as a `Semaphore` starting without any permits, although you can 
+//! optionally create an event that is already set. Every event mechanism in this crate can
+//! be described in terms of the [EventSetter] interface. A task waits for an event via the
+//! [wait](EventSetter::wait) method, and then is woken up through one of two calls:
+//! 1. [set_one](EventSetter::set_one) wakes up a single event.
+//! 2. [set_all](EventSetter::set_all) wakes up all the queued events.
+//! There is additionally a synchronous method, [try_wait](EventSetter::try_wait) which tries to
+//! acquire the event along the fast path. This is composed of two simple atomic operations and thus is
+//! very fast and does not need to be asynchronous.
+//! 
+//! # Quickstart
+//! For quickstart, you are most likely uniquely interested in the most basic event, which is
+//! also the most versatile, [Event].
+//! 
+//! A quick guide to usage for this event is shown below:
+//! ```
+//! # use pollster::FutureExt as _;
+//! # async {
+//! use asyncnal::{Event, EventSetter};
+//! 
+//! // We create a new event in the unset state.
+//! let event = Event::new();
+//! 
+//! // We set the event.
+//! event.set_one();
+//! 
+//! // We will be able to immediately acquire this event.
+//! event.wait().await;
+//! 
+//! # }.block_on()
+//! 
+//! ```
+//! 
+//! # Fairness
+//! The events are stored in a lock-free concurrent queue provided by [lfqueue](https://docs.rs/lfqueue/latest/lfqueue/),
+//! and are thus woken in a FIFO order. This means that if events are queued up in order `A`, `B`, `C`, they will be woken
+//! up in that order. For the case of [set_all](EventSetter::set_all), the events are guaranteed to be unloaded in FIFO order
+//! but events may make progress at different times depending on the nature of the executor.
+//! 
+//! 
+//! # Cancel Safety
+//! The events provided by the crate all fully cancel safe. This is achieved by special
+//! drop handling of the futures. Essentially, when a waiter is dropped, we check if we have modified
+//! the internal state of the event, and in this case, we roll it back. There is one catch though:
+//! 
+//! Due to the concurrent nature of the queues, we cannot simply just iterate over it and kick one event
+//! out of the queue. Therefore, the event has a way of communicating back to the queue where it signals that
+//! said queue entry is actually invalid, causing it to be skipped over. This is not, however, immediately evited
+//! from the queue.
+//! 
+//! # Examples
+//! ## Basic
+//! The example below shows the creation of an event, along with setting an event,
+//! and then immediately acquiring that event.
+//! ```
+//! # use pollster::FutureExt as _;
+//! # async {
+//! use asyncnal::{Event, EventSetter};
+//! 
+//! let event = Event::new();
+//! assert!(!event.has_waiters());
+//! 
+//! // We'll pre-set the event.
+//! event.set_one();
+//! 
+//! // This will immediately return.
+//! event.wait().await;
+//! # }.block_on()
+//! ```
+//! ## Asynchronous Mutex
+//! This signalling mechanism can be composed to create an asynchronous mutex to
+//! avoid system calls.
+//! ```
+//! # use pollster::FutureExt as _;
+//! # async {
+//! use asyncnal::*;
+//! use core::{cell::UnsafeCell, ops::{Deref, DerefMut}};
+//! 
+//! struct AsyncMutex<T> {
+//!     cell: UnsafeCell<T>,
+//!     event: Event
+//! }
+//! 
+//! struct AsyncMutexGuard<'a, T>(&'a AsyncMutex<T>);
+//! 
+//! impl<T> AsyncMutex<T> {
+//!     pub fn new(item: T) -> Self {
+//!         Self {
+//!             cell: UnsafeCell::new(item),
+//!             // Since the mutex should be in an available state initially,
+//!             // we should initialize the event in a pre-set state.
+//!             event: Event::new_set()
+//!         }
+//!     }
+//!     pub fn try_lock(&self) -> Option<AsyncMutexGuard<'_, T>> {
+//!         // Using the try_wait method we can implement a try_lock that
+//!         // is synchronous!
+//!         if self.event.try_wait() {
+//!             Some(AsyncMutexGuard(self))
+//!         } else {
+//!             // We could not acquire the lock on the fast
+//!             // path.
+//!             None
+//!         }
+//!     }
+//!     pub async fn lock(&self) -> AsyncMutexGuard<'_, T> {
+//!         // Wait for the event to become available.
+//!         self.event.wait().await;
+//!         AsyncMutexGuard(self)
+//!     }
+//! }
+//! 
+//! impl<'a, T> Drop for AsyncMutexGuard<'a, T> {
+//!     fn drop(&mut self) {
+//!         // Now we need to set the event to indicate it is now available!
+//!         self.0.event.set_one();
+//!     }
+//! }
+//! 
+//! impl<'a, T> Deref for AsyncMutexGuard<'a, T> {
+//!     type Target = T;
+//!     fn deref(&self) -> &T {
+//!         // SAFETY: The event guarantees we are the only
+//!         // ones with this guard.
+//!         unsafe { &*self.0.cell.get() }
+//!     }
+//! }
+//! 
+//! impl<'a, T> DerefMut for AsyncMutexGuard<'a, T> {
+//!     fn deref_mut(&mut self) -> &mut T {
+//!         // SAFETY: The event guarantees we are the only
+//!         // ones with this guard.
+//!         unsafe { &mut *self.0.cell.get() }
+//!     }
+//! 
+//! }
+//! 
+//! let mutex = AsyncMutex::new(4);
+//! assert_eq!(*mutex.lock().await, 4);
+//! 
+//! // Let's try to double acquire.
+//! // We start by acquiring a handle.
+//! let handle = mutex.lock().await;
+//! // Now the try_lock method should fail.
+//! assert!(mutex.try_lock().is_none());
+//! drop(handle);
+//! // Now that we have released the handle, we
+//! // can acquire :)
+//! assert!(mutex.try_lock().is_some());
+//! 
+//! 
+//! *mutex.lock().await = 5;
+//! 
+//! assert_eq!(*mutex.lock().await, 5);
+//! 
+//! # }.block_on();
+//! ```
+//! 
+//! ## Asynchronous Channels
+//! We can use this abstraction to trivially build asynchronous channels for
+//! local runtimes.
+//! ```
+//! # use pollster::FutureExt as _;
+//! # async {
+//! use std::{collections::VecDeque, cell::RefCell, rc::Rc};
+//! use asyncnal::{LocalEvent, EventSetter};
+//! 
+//! #[derive(Clone)]
+//! struct Channel<T> {
+//!     queue: Rc<RefCell<VecDeque<T>>>,
+//!     event: Rc<LocalEvent>
+//! }
+//! 
+//!
+//! 
+//! impl<T> Channel<T> {
+//!     pub fn new() -> Self {
+//!         Self {
+//!             queue: Rc::default(),
+//!             event: Rc::default()
+//!         }
+//!     }
+//!     pub fn send(&self, item: T) {
+//!         self.queue.borrow_mut().push_back(item);
+//!         self.event.set_one();
+//!     }
+//!     fn try_remove(&self) -> Option<T> {
+//!         self.queue.borrow_mut().pop_front()
+//!     }
+//!     pub async fn recv(&self) -> T {
+//!         let mut value = self.try_remove();
+//!         while value.is_none() {
+//!             // Wait for a notificaiton
+//!             self.event.wait().await;
+//!             value = self.try_remove();
+//!         }
+//!         value.unwrap()
+//!     }
+//!     
+//! }
+//! 
+//! let channel = Channel::<usize>::new();
+//! channel.send(4);
+//! assert_eq!(channel.recv().await, 4);
+//! # }.block_on();
+//! ```
+//! 
+#![cfg_attr(not(feature = "std"), no_std)]
 
 mod atomic;
-use crate::{asyncstd::Event, base::{event::EventSetter, lot::AsyncLotSignature}, yielder::Yield};
-use pin_project::pinned_drop;
 
 
 mod yielder;
 mod base;
+
+#[cfg(feature = "std")]
 mod asyncstd;
 mod nostds;
 
-
-use crate::atomic::*;
-
-
-/// A [CountedEvent] wraps a type that implements the [EventSetter] trait. It can tell
-/// you how many waiters there are on that very event. The count will only go up once the
-/// waiter actually starts waiting on the event. If there is an immediate return on the first
-/// time the wait is polled, the count will not go up.
-///
-/// The count will go up if the first call to poll wait returns [Poll::Pending], indicating that
-/// the waiter is actually waiting on notification. Upon notification, the count will
-/// be decremented.
-///
-/// # Cancel Safety
-/// On [Drop] the count is decremented if the [CountedAwaiter] had already
-/// incremented the count and is not yet in the complete state.
-pub struct CountedEvent<E> {
-    inner: E,
-    counter: AtomicUsize,
-}
-
-#[pin_project::pin_project(PinnedDrop)]
-#[allow(private_bounds)]
-pub struct CountedAwaiter<'a, E, F>
-where
-    E: EventSetter<'a>,
-    F: Future<Output = ()>,
-{
-    master: &'a CountedEvent<E>,
-    #[pin]
-    future: F,
-    state: CountedAwaiterState,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CountedAwaiterState {
-    /// The waiter has just been created and has
-    /// not yet incremented the count.
-    Init,
-    /// The waiter is in the waiting state, therefore
-    /// there has been an increase in the count
-    Waiting,
-    /// The waiter is actually complete, meaning that the
-    /// count has been decremented already.
-    Complete,
-}
-
-#[pinned_drop]
-impl<'a, E, F> PinnedDrop for CountedAwaiter<'a, E, F>
-where
-    E: EventSetter<'a>,
-    F: Future<Output = ()>,
-{
-    fn drop(self: Pin<&mut Self>) {
-        match self.state {
-            CountedAwaiterState::Init => {
-                // If we are initializing then we have not actually
-                // modified any of the state, so we are in the clear.
-            }
-            CountedAwaiterState::Waiting => {
-                // If we are in the waiting state then we have incremented
-                // the counter, so we need to undo this operation.
-                self.master.counter.fetch_sub(1, Ordering::Release);
-            }
-            CountedAwaiterState::Complete => {
-                // If we are complete than there is nothing to
-                // do so we do not execute any special drop code.
-            }
-        }
-    }
-}
-
-impl<'a, E, F> Future for CountedAwaiter<'a, E, F>
-where
-    E: EventSetter<'a>,
-    F: Future<Output = ()> + Unpin,
-{
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        // NOTE ON STATE: State is very important mostly for the reason of
-        // properly undoing things when stuff gets cancelled (dropped).
-        match this.state {
-            CountedAwaiterState::Init => {
-                // We are currently initializing. In this case we actually need
-                // to increment the waiting variables if there is not an immediate return.
-                match this.future.poll(cx) {
-                    Poll::Pending => {
-                        // In this case we have polled our future, and clearly have not immediately returned,
-                        // and thus we must increment the count and transition to the waiting
-                        // state.
-                        this.master.counter.fetch_add(1, Ordering::Release);
-                        *this.state = CountedAwaiterState::Waiting;
-                        Poll::Pending
-                    }
-                    Poll::Ready(_) => {
-                        // This is a special case of a fast return. This immediately short circuits
-                        // the future, and thus there is no need to increment the count.
-                        Poll::Ready(())
-                    }
-                }
-            }
-            CountedAwaiterState::Waiting => {
-                // We need to check if we are ready to complete.
-                match this.future.poll(cx) {
-                    // If we are still pending, then there
-                    // is nothing to be said here and we just return.
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(_) => {
-                        // If we are ready then we decrement the count.
-                        this.master.counter.fetch_sub(1, Ordering::Release);
-                        *this.state = CountedAwaiterState::Complete;
-                        Poll::Ready(())
-                    }
-                }
-            }
-            CountedAwaiterState::Complete => {
-                // The future should never really be polled here but
-                // if we do then we are ready.
-                Poll::Ready(())
-            }
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<E> CountedEvent<E>
-where
-    for<'a> E: EventSetter<'a>,
-{
-    #[allow(private_interfaces)]
-    pub fn new(source: E) -> Self {
-        Self {
-            inner: source,
-            counter: AtomicUsize::new(0),
-        }
-    }
-
-    #[allow(private_interfaces)]
-    pub fn wait(&self) -> <Self as EventSetter>::Waiter {
-        <Self as EventSetter>::wait(&self)
-    }
-
-    #[allow(private_interfaces)]
-    pub fn set_one(&self) {
-        <Self as EventSetter>::set_one(&self);
-    }
-
-    #[allow(private_interfaces)]
-    pub fn set_all(&self) {
-        <Self as EventSetter>::set_all(&self, || {});
-    }
-
-    pub fn count(&self) -> usize {
-        self.counter.load(Acquire)
-    }
-}
-
-impl<'a, E> EventSetter<'a> for CountedEvent<E>
-where
-    E: EventSetter<'a> + 'a,
-{
-    type Waiter = CountedAwaiter<'a, E, E::Waiter>;
+pub use base::event::EventSetter;
+pub use yielder::Yield;
 
 
-    fn new() -> Self {
-        Self {
-            counter: AtomicUsize::default(),
-            inner: E::new()
-        }
-    }
-
-    fn new_set() -> Self {
-        Self {
-            counter: AtomicUsize::default(),
-            inner: E::new_set()
-        }
-    }
-
-    fn wait(&'a self) -> CountedAwaiter<'a, E, E::Waiter> {
-        // self.counter.fetch_add(1, Release);
-        CountedAwaiter {
-            master: self,
-            future: self.inner.wait(),
-            state: CountedAwaiterState::Init,
-        }
-    }
-
-    fn try_wait(&self) -> bool {
-        if self.inner.try_wait() {
-            // self.counter.fetch_sub(1, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn set_all<F: FnMut()>(&self, mut functor: F) {
-        self.inner.set_all(|| {
-            functor();
-            self.counter.fetch_sub(1, Ordering::Release);
-        });
-    }
-    fn set_one(&self) -> bool {
-        if self.inner.set_one() {
-            // self.counter.fetch_sub(1, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    }
-    fn has_waiters(&self) -> bool {
-        self.inner.has_waiters()
-    }
-}
+#[cfg(feature = "std")]
+pub use asyncstd::{Event, EventAwait, CountedAwaiter, CountedEvent, LocalEvent, LocalEventAwait};
 
 
-#[cfg(test)]
+
+
+
+
+#[cfg(all(test, feature = "std"))]
 mod tests {
+    use core::pin::pin;
     use std::{
-        pin::{pin, Pin}, sync::{atomic::Ordering, Arc}, task::{Context, Wake, Waker}, thread::sleep, time::Duration
+        sync::Arc, task::{Context, Wake, Waker}
     };
+
+    use crate::{asyncstd::{CountedEvent, Event}, base::event::EventSetter};
 
     // use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter}
 
-    use crate::{CountedEvent, Event, EventSetter};
-
+ 
     /// Checks if a future will immediately return.
     fn can_poll_immediate(fut: impl Future) -> bool {
         let pinned = core::pin::pin!(fut);
@@ -325,6 +331,33 @@ mod tests {
 
         // Should immediately poll to true.
         assert!(core::pin::pin!(event.wait()).poll(&mut ctx).is_ready());
+    }
+
+    #[test]
+    pub fn test_event_hotpath_steal() {
+        // TEST: Checks that if the event is set and there is a
+        // pending event then it cannot be stolen and bypass the queue.
+
+        // Setup an event.
+        let event = Event::new();
+
+        // Setup the context.
+        let waker = Waker::from(Arc::new(TestWaker {}));
+        let mut ctx = Context::from_waker(&waker);
+
+        let mut waiter = core::pin::pin!(event.wait());
+
+        assert!(waiter.as_mut().poll(&mut ctx).is_pending());
+
+        // Wakes up one event.
+        event.set_one();
+
+        // Now this call should fail because the set was immediately (semantically)
+        // unset by the waiting event.
+        assert!(pin!(event.wait()).poll(&mut ctx).is_pending());
+
+        // Should immediately poll to true.
+        assert!(waiter.as_mut().poll(&mut ctx).is_ready());
     }
 
     #[test]
