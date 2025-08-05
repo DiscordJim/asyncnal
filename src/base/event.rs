@@ -365,13 +365,14 @@ where
 
 macro_rules! impl_async_event {
     (
+        $(#[$($attrss:tt)*])*
         name = $name:ident,
         waitername = $waitername:ident,
         lot = $lot:ident,
         state = $state:ident
     ) => {
         
-        
+        $(#[$($attrss)*])*
         pub struct $name(crate::base::event::RawEvent<$state, $lot>);
 
         #[pin_project::pin_project]

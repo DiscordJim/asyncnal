@@ -357,6 +357,8 @@ impl EventState for AtomicU8 {
 
 
 impl_async_event!(
+    /// An event for normal usage. It is [Send] and [Sync] and
+    /// can be used within multithreaded environments.
     name = Event,
     waitername = EventAwait,
     lot = AllocatedAsyncLot,
@@ -397,6 +399,8 @@ impl EventState for LocalState {
 }
 
 impl_async_event!(
+    /// An event for usage within local runtimess. It is `!Send` and
+    /// `!Sync`.
     name = LocalEvent,
     waitername = LocalEventAwait,
     lot = LocalAllocatedAsyncLot,

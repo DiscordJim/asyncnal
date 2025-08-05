@@ -1,5 +1,5 @@
 # asycnal
-> Fast asynchronous signalling primitives for multithreaded and singlethreaded runtimes
+> Fast, executor-agnostic, asynchronous signalling primitives for multithreaded and singlethreaded runtimes
 
 <div align="center">
 
