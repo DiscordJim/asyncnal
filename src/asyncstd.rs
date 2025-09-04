@@ -4,7 +4,7 @@ use std::{cell::{Cell, RefCell}, collections::VecDeque, rc::Rc, sync::{Arc}, tas
 use crossbeam_utils::CachePadded;
 use lfqueue::UnboundedQueue;
 
-use crate::base::{event::{impl_async_event, EventSetter, EventState}, lot::{impl_async_lot, AsyncLotSignature, AsyncLotTemplate}, signal::{TechnicalCounter, ValidityMarker, WakeQueue}};
+use crate::base::{event::{EventSetter, EventState, EventWaker, impl_async_event}, lot::{AsyncLotSignature, AsyncLotTemplate, impl_async_lot}, signal::{TechnicalCounter, ValidityMarker, ValidityState, WakeQueue}};
 
 use crate::atomic::*;
 
@@ -225,15 +225,15 @@ where
 
 
 
-impl ValidityMarker for Arc<AtomicBool> {
+impl ValidityMarker for Arc<AtomicU8> {
     fn create() -> Self {
-        Arc::new(AtomicBool::new(true))
+        Arc::new(AtomicU8::new(ValidityState::Idle as u8))
     }
-    fn get(&self) -> bool {
-        self.load(Acquire)
+    fn get(&self) -> ValidityState {
+        ValidityState::from_u8(self.load(Acquire)).expect("Invalid validity state discriminant stored.")
     }
-    fn set(&self, value: bool) {
-        self.store(value, Release);
+    fn set(&self, value: ValidityState) {
+        self.store(value as u8, Release);
     }
 }
 
@@ -301,14 +301,14 @@ impl<T> WakeQueue<T> for LocalQueue<T> {
     }
 }
 
-impl ValidityMarker for Rc<Cell<bool>> {
+impl ValidityMarker for Rc<Cell<ValidityState>> {
     fn create() -> Self {
-        Rc::new(Cell::new(true))
+        Rc::new(Cell::new(ValidityState::Idle))
     }
-    fn get(&self) -> bool {
+    fn get(&self) -> ValidityState {
         Cell::get(&self)
     }
-    fn set(&self, value: bool) {
+    fn set(&self, value: ValidityState) {
         Cell::set(&self, value);
     }
 }
@@ -318,16 +318,16 @@ impl ValidityMarker for Rc<Cell<bool>> {
 
 impl_async_lot!(
     name = LocalAllocatedAsyncLot,
-    waker = Waker,
-    validity = Rc<Cell<bool>>,
+    waker = EventWaker,
+    validity = Rc<Cell<ValidityState>>,
     counter = LocalCounter,
     queue = LocalQueue
 );
 
 impl_async_lot!(
     name = AllocatedAsyncLot,
-    waker = Waker,
-    validity = Arc<AtomicBool>,
+    waker = EventWaker,
+    validity = Arc<AtomicU8>,
     counter = CachePadded<AtomicUsize>,
     queue = UnboundedQueue
 );
@@ -364,6 +364,7 @@ impl_async_event!(
     lot = AllocatedAsyncLot,
     state = AtomicU8
 );
+
 
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}

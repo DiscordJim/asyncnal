@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, task::Waker};
 
-use crate::base::signal::{TechnicalCounter, ValidityMarker, WakeQueue};
+use crate::base::{event::EventWaker, signal::{TechnicalCounter, ValidityMarker, ValidityState, WakeQueue}};
 
 
 pub(crate) struct AsyncLotTemplate<V, C, Q>
@@ -13,7 +13,7 @@ pub(crate) struct AsyncLotTemplate<V, C, Q>
 impl<V, C, Q> Default for AsyncLotTemplate<V, C, Q>
 where 
     C: TechnicalCounter,
-    Q: WakeQueue<(Waker, V)>
+    Q: WakeQueue<(EventWaker, V)>
 {
     fn default() -> Self {
         Self {
@@ -30,10 +30,10 @@ impl<V, C, Q> AsyncLotTemplate<V, C, Q>
 where 
     V: ValidityMarker,
     C: TechnicalCounter,
-    Q: WakeQueue<(Waker, V)>
+    Q: WakeQueue<(EventWaker, V)>
 {
     #[inline]
-    fn park(&self, waker: &Waker) -> V {
+    fn park(&self, waker: &EventWaker) -> V {
         self.counter.increment();
         let notifier = V::create();
         self.inner.enqueue((waker.clone(), notifier.clone()));
@@ -42,7 +42,8 @@ where
     #[inline]
     fn unpark_one(&self) -> bool {
         if let Some((waker, signal)) = self.try_unpark() {
-            if signal.get() {
+            if signal.get() == ValidityState::Idle {
+                signal.set(ValidityState::ShouldWake);
                 waker.wake_by_ref();
                 true
             } else {
@@ -58,7 +59,7 @@ where
     fn has_waiters(&self) -> bool {
         self.counter.get() != 0
     }
-    fn try_unpark(&self) -> Option<(Waker, V)> {
+    fn try_unpark(&self) -> Option<(EventWaker, V)> {
         self.inner.dequeue()
     }
 }
@@ -68,7 +69,7 @@ pub trait AsyncLotSignature: Default {
     type ValidityMarker: ValidityMarker;
 
     fn new() -> Self;
-    fn park(&self, cx: &core::task::Context<'_>) -> Self::ValidityMarker;
+    fn park(&self, cx: &EventWaker) -> Self::ValidityMarker;
     fn notify_wait_release(&self);
     fn has_waiters(&self) -> bool;
     fn unpark_one(&self) -> bool;
@@ -78,7 +79,7 @@ impl<V, C, Q> AsyncLotSignature for AsyncLotTemplate<V, C, Q>
 where 
     V: ValidityMarker,
     C: TechnicalCounter,
-    Q: WakeQueue<(Waker, V)>
+    Q: WakeQueue<(EventWaker, V)>
 {
 
     type ValidityMarker = V;
@@ -97,8 +98,8 @@ where
         AsyncLotTemplate::notify_wait_release(&self);
     }
     #[inline]
-    fn park(&self, cx: &core::task::Context<'_>) -> Self::ValidityMarker {
-        AsyncLotTemplate::park(&self, cx.waker())
+    fn park(&self, cx: &EventWaker) -> Self::ValidityMarker {
+        AsyncLotTemplate::park(&self, cx)
     }
     #[inline]
     fn unpark_one(&self) -> bool {
@@ -138,7 +139,7 @@ macro_rules! impl_async_lot {
                 AsyncLotTemplate::has_waiters(&self.0)
             }
             #[inline]
-            fn park(&self, cx: &core::task::Context<'_>) -> $vf {
+            fn park(&self, cx: &crate::base::event::EventWaker) -> $vf {
                 AsyncLotTemplate::park(&self.0, cx)
             }
             #[inline]

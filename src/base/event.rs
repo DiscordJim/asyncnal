@@ -1,11 +1,12 @@
-use crate::{atomic::*, base::{lot::AsyncLotSignature, signal::ValidityMarker}, yielder::Yield};
+use crate::{atomic::*, base::{lot::AsyncLotSignature, signal::{ValidityMarker, ValidityState}}, yielder::Yield};
 use core::{
     ops::ControlFlow,
     pin::{Pin, pin},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use core::future::Future;
+use std::sync::Arc;
 
 
 /// Describes an event interface that can be created in
@@ -91,6 +92,84 @@ const BACKOFF_MAX: usize = 3;
 const SIGNAL_FREE: u8 = 0b00;
 const SIGNAL_SET: u8 = 0b10;
 
+
+// #[derive(Clone)]
+pub(crate) struct EventWaker {
+    cell: Arc<AtomicPtr<Waker>>
+}
+
+impl Clone for EventWaker {
+    fn clone(&self) -> Self {
+        let ptr = self.cell.load(Acquire);
+        if !ptr.is_null() {
+            unsafe {
+                Arc::increment_strong_count(ptr.cast_const());
+            }
+        }
+
+        Self {
+            cell: Arc::clone(&self.cell)
+        }
+
+    }
+}
+
+impl Drop for EventWaker {
+    fn drop(&mut self) {
+        let ptr = self.cell.load(Acquire);
+        unsafe { Self::drop_old_ptr(ptr) };
+        // let waker = Arc::from_raw(self.ce)
+    }
+}
+
+impl EventWaker {
+    pub fn new(waker: &Waker) -> Self {
+        let allocated = Arc::into_raw(Arc::new(waker.to_owned()));
+        Self {
+            cell: Arc::new(AtomicPtr::new(allocated.cast_mut()))
+        }
+    }
+    pub fn wake_by_ref(&self) {
+        let ptr = self.cell.load(Acquire);
+        if !ptr.is_null() {
+            unsafe { (&*ptr).wake_by_ref(); }
+        }
+    }
+    pub fn is_null(&self) -> bool {
+        self.cell.load(Acquire).is_null()
+    }
+    pub fn set_null(&self) {
+        self.cell.store(std::ptr::null_mut(), Release);
+    }
+    
+    pub unsafe fn drop_old_ptr(ptr: *mut Waker) {
+        if !ptr.is_null() {
+            let _ = unsafe { Arc::from_raw(ptr) };
+        }
+    }
+    pub fn check_and_swap(&self, other: &Waker) {
+        let ptr = self.cell.load(Acquire);
+        if !ptr.is_null() {
+            if !unsafe { (&*ptr).will_wake(other) } {
+                let new = Arc::into_raw(Arc::new(other.to_owned()));
+                match self.cell.compare_exchange(ptr, new.cast_mut(), AcqRel, Acquire) {
+                    Ok(old) => {
+                        unsafe { Self::drop_old_ptr(old) };
+                    }
+                    Err(_) => {
+                        let _ = unsafe { Arc::from_raw(new) };
+                        self.check_and_swap(other);
+                    }
+                }
+                // self.drop_current_cell();
+                // self.cell.store(ptr, order);
+            }
+        }
+    }
+}
+
+// pub(crate) struct RawEventSharedCtx<'a, S, L>
+
 pub(crate) struct RawEventAwait<'a, S, L>
 where
     L: AsyncLotSignature,
@@ -99,6 +178,7 @@ where
     state: RawEventAwaitState,
     backoff: usize,
     yielder: Option<Yield>,
+    waker: Option<EventWaker>,
     wait_link: Option<L::ValidityMarker>,
 }
 
@@ -111,7 +191,10 @@ where
     #[inline]
     fn park_waker(&mut self, cx: &Context<'_>) -> L::ValidityMarker {
         self.state = RawEventAwaitState::Waiting;
-        self.event.lot.park(cx)
+        let event = EventWaker::new(cx.waker());
+        self.waker = Some(event.clone());
+        self.event.lot.park(&event)
+        
     }
     #[inline]
     fn backoff(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -124,6 +207,51 @@ where
         } else {
             self.yielder = Some(Yield::default());
             return self.poll(cx);
+        }
+    }
+
+    #[inline]
+    fn perform_waker_swap(&mut self, cx: &mut Context<'_>) {
+        if self.waker.is_none() {
+            self.waker = Some(EventWaker::new(cx.waker()));
+        } else {
+            let Some(waker) = &mut self.waker else {
+                unreachable!()
+            };
+            
+            // Perform the check and swap it out if necessary.
+            waker.check_and_swap(cx.waker());
+        }
+    }
+
+    #[inline]
+    fn should_ready(&mut self) -> bool {
+        if self.state == RawEventAwaitState::Waiting {
+            match &self.wait_link {
+                Some(link) => match link.get() {
+                    ValidityState::Idle => {
+                        // The wakeup was spurious!
+                        false
+                    }
+                    ValidityState::Killed => {
+                        false
+                    }
+                    ValidityState::ShouldWake => {
+                        // We have been woken correctly.
+                        true
+                    }
+                },
+                None => {
+                    // The wait link is not ready, so
+                    // we cannot ready.
+                    false
+                }
+            }
+
+        } else {
+            // We are not even in the wait state so of
+            // course we are not ready.
+            false
         }
     }
 
@@ -164,6 +292,7 @@ where
         // Here we check if we are yielding, this is an asynchronous version of
         // backoff. If this returns `Continue` then we must poll again.
         if let ControlFlow::Continue(()) = self.try_yield(cx) {
+            self.perform_waker_swap(cx);
             return Poll::Pending;
         }
 
@@ -180,9 +309,14 @@ where
                 // and that is not fair.
 
                 // The exception is if we were already parked. In this case, we can just unpark the next thread and then return ourselves.
-                if self.state == RawEventAwaitState::Waiting {
+                if self.should_ready() {
                     // Release.
                     return release_complete(&mut *self);
+                } else if self.state == RawEventAwaitState::Waiting {
+                    // In this state we were woken up spuriously, so
+                    // we need to perform the waker swap.
+                    self.perform_waker_swap(cx);
+                    return Poll::Pending;
                 }
 
                 // SOLUTION:
@@ -212,8 +346,11 @@ where
                         // to back. In this case let's say Thread A & B are enqueued. Then the first set() call
                         // wakes `A`, `A` unsets the bit, and then when thread `B` is polled it believes it
                         // was called by mistake. Thus, we return here.
-                        if self.state == RawEventAwaitState::Waiting {
+                        if self.should_ready() {
                             return release_complete(&mut *self);
+                        } else if self.state == RawEventAwaitState::Waiting {
+                            self.perform_waker_swap(cx);
+                            return Poll::Pending;
                         }
 
                         // The wait flag was set by someone else, so the
@@ -300,7 +437,8 @@ where
             event: &self,
             state: RawEventAwaitState::Init,
             wait_link: None,
-            yielder: None
+            yielder: None,
+            waker: None
         }
     }
 
@@ -348,7 +486,8 @@ where
                 // We have modified the state and are waiting in
                 // the queue.
                 if let Some(waiter) = &self.wait_link {
-                    waiter.set(false);
+                    waiter.set(ValidityState::Killed);
+                    
                     // self.event.waker.notify_wait_release();
                     // TODO: Unset bit here.
                     self.event.lot.notify_wait_release();

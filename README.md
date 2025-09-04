@@ -1,6 +1,8 @@
 # asycnal
 > Fast, executor-agnostic, asynchronous signalling primitives for multithreaded and singlethreaded runtimes
 
+TODO: Deal wwith the waker swap
+
 <div align="center">
 
 [![GitHub Actions Status](https://github.com/DiscordJim/asyncnal/actions/workflows/rust.yml/badge.svg)](https://github.com/DiscordJim/asyncnal/actions) · [![Crates.io Version](https://img.shields.io/crates/v/asyncnal.svg)](https://crates.io/crates/asyncnal) · [![Crates.io Downloads](https://img.shields.io/crates/d/asyncnal.svg)](https://crates.io/crates/asyncnal) · [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/DiscordJim/asyncnal/blob/main/LICENSE)

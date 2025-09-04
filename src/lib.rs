@@ -227,7 +227,6 @@ mod base;
 
 #[cfg(feature = "std")]
 mod asyncstd;
-mod nostds;
 
 pub use base::event::EventSetter;
 pub use yielder::Yield;
@@ -284,6 +283,63 @@ mod tests {
         }
     }
 
+
+    #[test]
+    pub fn test_shared_waker_correctness() {
+        // TEST: This verifies that if the signal shares a waker
+        // with someone else this will not influence the event.
+        let event_a = Event::new();
+        let event_b = Event::new();
+        
+        let waker = Waker::from(Arc::new(TestWaker {}));
+        let mut ctx = Context::from_waker(&waker);
+
+        let mut waiting_a = core::pin::pin!(event_a.wait());
+        let mut waiting_b = core::pin::pin!(event_b.wait());
+        assert!(waiting_a.as_mut().poll(&mut ctx).is_pending());
+        assert!(waiting_b.as_mut().poll(&mut ctx).is_pending());
+
+        // Set event B.
+        event_b.set_one();
+
+        // Event A should still be sleeping and Event B should
+        // have woken up.
+        assert!(waiting_a.as_mut().poll(&mut ctx).is_pending());
+        assert!(waiting_b.as_mut().poll(&mut ctx).is_ready());
+        assert!(waiting_a.as_mut().poll(&mut ctx).is_pending());
+    
+
+
+    }
+
+    #[test]
+    pub fn test_waker_swap_correctness() {
+        // TEST: This verifies that the event is still sound
+        // if the event is polled with a different waker.
+        let event = Event::new();
+
+        let waker_a = Waker::from(Arc::new(TestWaker {}));
+        let mut ctx_a = Context::from_waker(&waker_a);
+        let waker_b = Waker::from(Arc::new(TestWaker {}));
+        let mut ctx_b = Context::from_waker(&waker_b);
+
+        let mut waiting = core::pin::pin!(event.wait());
+        assert!(!event.has_waiters());
+        assert!(waiting.as_mut().poll(&mut ctx_a).is_pending());
+        assert!(event.has_waiters());
+
+
+        // Now that we have succesfully docked, we should use the other waker and check
+        // that we swap it out correctly.
+        assert!(waiting.as_mut().poll(&mut ctx_b).is_pending());
+        
+
+// 
+        // event.set_one();
+
+        // assert!(waiting.as_mut().poll(&mut ctx_b).i)
+
+    }
 
     #[test]
     pub fn test_countable_correctness() {
